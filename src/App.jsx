@@ -299,7 +299,13 @@ export default function App() {
   /* ── Initialize GPU renderer when canvas mounts ── */
   const canvasCallbackRef = useCallback((canvas) => {
     canvasRef.current = canvas;
-    if (canvas && !gpuRef.current && isWebGL2Supported()) {
+    if (!canvas) {
+      // Canvas unmounted (e.g. "New Image") — destroy renderer
+      if (gpuRef.current) { gpuRef.current.destroy(); gpuRef.current = null; }
+      lastLutKeyRef.current = null;
+      return;
+    }
+    if (!gpuRef.current && isWebGL2Supported()) {
       try {
         gpuRef.current = createRenderer(canvas);
         // If image was loaded before canvas mounted, upload it now
