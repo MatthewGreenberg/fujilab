@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { parse3DL, parseCube, applyLUT } from "./lut";
+import { parse3DL, parseCube } from "./lut"; // applyLUT no longer needed — GPU does trilinear interpolation
 import CurveEditor, { buildCurveLUT } from "./CurveEditor";
+import { createRenderer, isWebGL2Supported } from "./gpu/renderer";
 
 const BUNDLED_LUTS = [
   "Fuji XTrans III - Acros.3dl",
@@ -179,31 +180,7 @@ const RECIPES = [
 
 const RECIPE_CATEGORIES = ["Kodak", "Cinematic", "Street", "Fuji", "B&W"];
 
-const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
-
-/*
-  Deterministic position-based grain hash.
-  Produces stable noise that doesn't shimmer when other adjustments change.
-  Integer hash gives spatial correlation between neighboring pixels.
-*/
-function grainHash(x, y) {
-  let h = (x * 374761393 + y * 668265263) | 0;
-  h = Math.imul(h ^ (h >>> 13), 1103515245);
-  h = Math.imul(h ^ (h >>> 16), 2654435769);
-  return (h & 0xffff) / 65536; // 0 to 1
-}
-
-/* Compute hue in degrees from RGB (0-255 inputs). Returns -1 for achromatic. */
-function rgbHue(r, g, b) {
-  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-  const range = mx - mn;
-  if (range < 8) return -1;
-  let h;
-  if (mx === r) h = ((g - b) / range) % 6;
-  else if (mx === g) h = (b - r) / range + 2;
-  else h = (r - g) / range + 4;
-  return ((h * 60) + 360) % 360;
-}
+// clamp, grainHash, rgbHue — now handled by the GLSL fragment shader
 
 /* ── Collapsible panel ── */
 function Panel({ title, children, defaultOpen = true }) {
@@ -272,11 +249,13 @@ export default function App() {
   const [loadingLuts, setLoadingLuts] = useState(true);
 
   const canvasRef = useRef(null);
+  const gpuRef = useRef(null);
   const originalDataRef = useRef(null);
   const dimsRef = useRef({ w: 0, h: 0 });
   const fileRef = useRef(null);
   const lutFileRef = useRef(null);
   const wrapperRef = useRef(null);
+  const lastLutKeyRef = useRef(null);
 
   const setField = useCallback((field, value) => {
     setAdj((prev) => ({ ...prev, [field]: value }));
@@ -317,36 +296,32 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  /* ── Image processing pipeline ── */
-  const processImage = useCallback(() => {
-    const od = originalDataRef.current;
-    const canvas = canvasRef.current;
-    if (!od || !canvas) return;
+  /* ── Initialize GPU renderer when canvas mounts ── */
+  const canvasCallbackRef = useCallback((canvas) => {
+    canvasRef.current = canvas;
+    if (canvas && !gpuRef.current && isWebGL2Supported()) {
+      try {
+        gpuRef.current = createRenderer(canvas);
+        // If image was loaded before canvas mounted, upload it now
+        const od = originalDataRef.current;
+        if (od) {
+          const { w, h } = dimsRef.current;
+          gpuRef.current.uploadImage(od, w, h);
+        }
+      } catch (err) {
+        console.warn("WebGL 2 init failed, will not render:", err);
+      }
+    }
+  }, []);
 
-    const { w, h } = dimsRef.current;
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    const src = od.data;
-    const out = ctx.createImageData(w, h);
-    const dst = out.data;
-
-    const {
-      intensity, exposure, contrast, highlights, shadows, whites, blacks,
-      temperature, tint, vibrance, saturation, grain, grainSize, vignette,
-      highlightRolloff, colorChrome, colorChromeFxBlue, fade,
-    } = adj;
-    const lut = luts[activePreset];
-    const t = intensity / 100;
-
-    // Pre-compute per-channel curve LUTs
+  /* ── Build per-channel curve LUTs (cheap, stays on CPU) ── */
+  const buildCurveTables = useCallback(() => {
+    const { exposure, contrast, whites, blacks, highlightRolloff, fade } = adj;
     const rgbCurve = buildCurveLUT(curves.rgb);
     const rCurve = buildCurveLUT(curves.r);
     const gCurve = buildCurveLUT(curves.g);
     const bCurve = buildCurveLUT(curves.b);
 
-    // Pre-compute combined per-channel tables:
-    // exposure → contrast → highlight rolloff → whites/blacks → fade → curves
     const expMul = Math.pow(2, exposure);
     const contrastF = 1 + contrast / 100;
     const wt = whites / 100;
@@ -358,27 +333,19 @@ export default function App() {
       const table = new Uint8Array(256);
       for (let i = 0; i < 256; i++) {
         let v = i / 255;
-        // Exposure
         v *= expMul;
-        // Contrast (centered at 0.5)
         v = 0.5 + (v - 0.5) * contrastF;
-        // Highlight rolloff: soft shoulder (film-like)
         if (rolloff > 0 && v > 0.5) {
-          const threshold = 1 - rolloff * 0.5; // 0.5 to 1.0
+          const threshold = 1 - rolloff * 0.5;
           if (v > threshold) {
             const excess = v - threshold;
             const softness = rolloff * 0.4;
             v = threshold + softness * (1 - Math.exp(-excess / softness));
           }
         }
-        // Whites (boost bright values quadratically)
         v += wt * 0.4 * v * v;
-        // Blacks (lift dark values quadratically)
         v += bt * 0.4 * (1 - v) * (1 - v);
-        // Fade (lift the floor — mimics faded/matte film)
-        if (fadeAmt > 0) {
-          v = fadeAmt + v * (1 - fadeAmt);
-        }
+        if (fadeAmt > 0) v = fadeAmt + v * (1 - fadeAmt);
         v = Math.max(0, Math.min(1, v));
         const idx = Math.max(0, Math.min(255, Math.round(v * 255)));
         table[i] = chanCurve[rgbCurve[idx]];
@@ -386,168 +353,50 @@ export default function App() {
       return table;
     };
 
-    const rTable = buildTable(rCurve);
-    const gTable = buildTable(gCurve);
-    const bTable = buildTable(bCurve);
+    return { r: buildTable(rCurve), g: buildTable(gCurve), b: buildTable(bCurve) };
+  }, [adj, curves]);
 
-    // Feature flags for per-pixel branches
-    const hasCC = colorChrome > 0;
-    const hasCCB = colorChromeFxBlue > 0;
-    const hasHL = highlights !== 0 || shadows !== 0;
-    const hasTT = temperature !== 0 || tint !== 0;
-    const hasVS = vibrance !== 0 || saturation !== 0;
-    const hasGrain = grain > 0;
-    const hasVig = vignette > 0;
-    const grainAmt = grain / 100;
-    const grainAmp = 55 + (grainSize / 100) * 35; // 55-90 noise amplitude
-    const grainCellSize = 1.0 + (grainSize / 100) * 2.5; // 1-3.5 px cell size for clumping
-    const vigAmt = vignette / 100;
-    const cx = w / 2, cy = h / 2;
-    const ccAmt = colorChrome / 100;
-    const ccbAmt = colorChromeFxBlue / 100;
+  /* ── GPU render pass ── */
+  const processImage = useCallback(() => {
+    const gpu = gpuRef.current;
+    if (!gpu || !originalDataRef.current) return;
 
-    for (let py = 0; py < h; py++) {
-      for (let px = 0; px < w; px++) {
-        const i = (py * w + px) * 4;
-        let r = src[i], g = src[i + 1], b = src[i + 2];
+    const { intensity, highlights, shadows, temperature, tint, vibrance, saturation, colorChrome, colorChromeFxBlue, vignette, grain, grainSize } = adj;
+    const lut = luts[activePreset];
 
-        // 1. Film simulation LUT
-        if (lut) {
-          const [nr, ng, nb] = applyLUT(lut, r, g, b);
-          r = Math.round(r + (clamp(nr) - r) * t);
-          g = Math.round(g + (clamp(ng) - g) * t);
-          b = Math.round(b + (clamp(nb) - b) * t);
-        }
-
-        // 2. Per-channel table (exposure + contrast + rolloff + whites/blacks + fade + curves)
-        r = rTable[r];
-        g = gTable[g];
-        b = bTable[b];
-
-        // 3. Color Chrome Effect: reduce luminance in saturated warm hues (R/O/Y/G)
-        //    to prevent channel clipping and retain tonal gradation.
-        //    Blues are excluded — that's Color Chrome FX Blue's job.
-        if (hasCC || hasCCB) {
-          const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-          const range = mx - mn;
-          const sat = mx > 0 ? range / mx : 0;
-          const hue = range > 8 ? rgbHue(r, g, b) : -1;
-          const lum = r * 0.299 + g * 0.587 + b * 0.114;
-
-          // Color Chrome: warm hues (0-170°), fading out toward blues
-          if (hasCC && sat > 0.4 && hue >= 0) {
-            let hueMask = 1;
-            if (hue > 140 && hue < 200) hueMask = Math.max(0, 1 - (hue - 140) / 60);
-            else if (hue >= 200) hueMask = 0;
-            if (hueMask > 0) {
-              const strength = ((sat - 0.4) / 0.6) * ccAmt * hueMask;
-              const factor = lum < 128
-                ? 1 - strength * 0.3 * (1 - lum / 128)
-                : 1 - strength * 0.04;
-              r = clamp(r * factor); g = clamp(g * factor); b = clamp(b * factor);
-            }
-          }
-
-          // Color Chrome FX Blue: blues/purples (190-280°)
-          if (hasCCB && sat > 0.3 && hue >= 0) {
-            const dist = Math.min(Math.abs(hue - 235), 360 - Math.abs(hue - 235));
-            if (dist < 55) {
-              const mask = Math.cos((dist / 55) * Math.PI * 0.5);
-              const strength = mask * sat * ccbAmt;
-              const factor = lum < 128
-                ? 1 - strength * 0.35 * (1 - lum / 128)
-                : 1 - strength * 0.05;
-              r = clamp(r * factor); g = clamp(g * factor); b = clamp(b * factor);
-            }
-          }
-        }
-
-        // 5. Highlights / Shadows (luminance-dependent)
-        if (hasHL) {
-          const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
-          if (highlights !== 0) {
-            const hw = lum > 0.5 ? (lum - 0.5) * 2 : 0;
-            const hadj = highlights * 0.5 * hw * hw;
-            r = clamp(r + hadj); g = clamp(g + hadj); b = clamp(b + hadj);
-          }
-          if (shadows !== 0) {
-            const sw = lum < 0.5 ? (0.5 - lum) * 2 : 0;
-            const sadj = shadows * 0.5 * sw * sw;
-            r = clamp(r + sadj); g = clamp(g + sadj); b = clamp(b + sadj);
-          }
-        }
-
-        // 6. Temperature / Tint
-        if (hasTT) {
-          r = clamp(r + temperature * 0.3);
-          g = clamp(g + tint * 0.25 - temperature * 0.1);
-          b = clamp(b - temperature * 0.3);
-        }
-
-        // 7. Saturation then Vibrance
-        if (hasVS) {
-          let avg = (r + g + b) / 3;
-          if (saturation !== 0) {
-            const sf = 1 + saturation / 100;
-            r = clamp(avg + (r - avg) * sf);
-            g = clamp(avg + (g - avg) * sf);
-            b = clamp(avg + (b - avg) * sf);
-          }
-          if (vibrance !== 0) {
-            const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-            const sat = mx > 0 ? (mx - mn) / mx : 0;
-            const vf = 1 + (vibrance / 100) * (1 - sat);
-            avg = (r + g + b) / 3;
-            r = clamp(avg + (r - avg) * vf);
-            g = clamp(avg + (g - avg) * vf);
-            b = clamp(avg + (b - avg) * vf);
-          }
-        }
-
-        // 8. Vignette
-        if (hasVig) {
-          const dx = (px - cx) / cx, dy = (py - cy) / cy;
-          const vig = 1 - vigAmt * (dx * dx + dy * dy) * 0.5;
-          r = clamp(r * vig); g = clamp(g * vig); b = clamp(b * vig);
-        }
-
-        // 9. Film grain: deterministic, spatially-correlated, midtone-weighted
-        //    Uses position-based hash (stable across re-renders) with bilinear
-        //    interpolation between grid points for organic clumping texture.
-        if (hasGrain) {
-          const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
-          // Bell curve: peak at lower-midtones (0.4), fall off at extremes
-          const grainWeight = Math.exp(-((lum - 0.4) * (lum - 0.4)) / 0.1225);
-          // Bilinear interpolation between hash grid points for clumping
-          const fx = px / grainCellSize, fy = py / grainCellSize;
-          const x0 = Math.floor(fx), y0 = Math.floor(fy);
-          const dx = fx - x0, dy = fy - y0;
-          const n00 = grainHash(x0, y0);
-          const n10 = grainHash(x0 + 1, y0);
-          const n01 = grainHash(x0, y0 + 1);
-          const n11 = grainHash(x0 + 1, y0 + 1);
-          const noise = ((n00 + (n10 - n00) * dx) + ((n01 + (n11 - n01) * dx) - (n00 + (n10 - n00) * dx)) * dy - 0.5) * 2;
-          const grainVal = noise * grainAmp * grainAmt * grainWeight;
-          r = clamp(r + grainVal); g = clamp(g + grainVal); b = clamp(b + grainVal);
-        }
-
-        dst[i] = r; dst[i + 1] = g; dst[i + 2] = b; dst[i + 3] = src[i + 3];
+    // Upload 3D LUT if preset changed
+    if (activePreset !== lastLutKeyRef.current) {
+      if (lut) {
+        gpu.uploadLUT(lut.data, lut.size);
       }
+      lastLutKeyRef.current = activePreset;
     }
 
-    // Split view: left side shows original
-    if (splitView) {
-      const splitX = Math.round((splitPos / 100) * w);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < splitX; x++) {
-          const idx = (y * w + x) * 4;
-          dst[idx] = src[idx]; dst[idx + 1] = src[idx + 1]; dst[idx + 2] = src[idx + 2];
-        }
-      }
-    }
+    // Build and upload per-channel curve LUTs
+    const tables = buildCurveTables();
+    gpu.uploadCurveLUTs(tables.r, tables.g, tables.b);
 
-    ctx.putImageData(out, 0, 0);
-  }, [adj, activePreset, luts, curves, splitView, splitPos]);
+    // Render
+    gpu.render({
+      lutSize: lut ? lut.size : 0,
+      hasLut: !!lut,
+      intensity: intensity / 100,
+      highlights,
+      shadows,
+      temperature,
+      tint,
+      saturation,
+      vibrance,
+      colorChrome: colorChrome / 100,
+      colorChromeFxBlue: colorChromeFxBlue / 100,
+      vignette: vignette / 100,
+      grain: grain / 100,
+      grainAmp: 55 + (grainSize / 100) * 35,
+      grainCellSize: 1.0 + (grainSize / 100) * 2.5,
+      splitView,
+      splitPos,
+    });
+  }, [adj, activePreset, luts, curves, splitView, splitPos, buildCurveTables]);
 
   useEffect(() => {
     if (imageLoaded) processImage();
@@ -570,7 +419,10 @@ export default function App() {
         offscreen.width = w; offscreen.height = h;
         const octx = offscreen.getContext("2d");
         octx.drawImage(img, 0, 0, w, h);
-        originalDataRef.current = octx.getImageData(0, 0, w, h);
+        const imageData = octx.getImageData(0, 0, w, h);
+        originalDataRef.current = imageData;
+        lastLutKeyRef.current = null; // force LUT re-upload
+        if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
         setActivePreset("original");
         setAdj(DEFAULT_ADJ);
         setCurves(DEFAULT_CURVES);
@@ -748,7 +600,7 @@ export default function App() {
             </div>
           ) : (
             <>
-              <canvas ref={canvasRef} style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }} />
+              <canvas ref={canvasCallbackRef} style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }} />
               {splitView && (
                 <div
                   onMouseDown={(e) => { e.preventDefault(); setDraggingSplit(true); }}
