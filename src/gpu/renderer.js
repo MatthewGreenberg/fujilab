@@ -290,7 +290,10 @@ void main() {
   if (u_hasLut > 0.5) {
     float scale = (u_lutSize - 1.0) / u_lutSize;
     float offset = 0.5 / u_lutSize;
-    vec3 graded = texture(u_lut, color * scale + offset).rgb;
+    // LUT data is R-outer, G-middle, B-inner (B fastest in memory).
+    // texImage3D maps S(x)=fastest, T(y)=middle, R(z)=slowest.
+    // So sample with BGR to align input channels to correct LUT axes.
+    vec3 graded = texture(u_lut, color.bgr * scale + offset).rgb;
     color = mix(color, graded, u_intensity);
   }
 
