@@ -503,6 +503,47 @@ export default function App() {
     const ctx = overlayCanvas.getContext("2d");
     ctx.clearRect(0, 0, w, h);
     ctx.putImageData(new ImageData(out, w, h), 0, 0);
+
+    // Draw mask edge outline for selection visibility
+    // Dim non-selected area slightly
+    const dimData = ctx.createImageData(w, h);
+    for (let i = 0; i < w * h; i++) {
+      if (!maskData[i]) {
+        dimData.data[i * 4 + 3] = 40; // subtle dark overlay on background
+      }
+    }
+    ctx.putImageData(dimData, 0, 0);
+    // Re-draw subject pixels on top of the dim
+    ctx.putImageData(new ImageData(out, w, h), 0, 0);
+
+    // Draw edge outline by finding mask boundary pixels
+    const edgeData = ctx.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const idx = y * w + x;
+        if (!maskData[idx]) continue;
+        // Check if any 4-connected neighbor is outside mask
+        const isEdge =
+          (x === 0 || !maskData[idx - 1]) ||
+          (x === w - 1 || !maskData[idx + 1]) ||
+          (y === 0 || !maskData[idx - w]) ||
+          (y === h - 1 || !maskData[idx + w]);
+        if (isEdge) {
+          const pi = idx * 4;
+          edgeData.data[pi] = 255;
+          edgeData.data[pi + 1] = 255;
+          edgeData.data[pi + 2] = 255;
+          edgeData.data[pi + 3] = 180;
+        }
+      }
+    }
+    // Draw edge as a separate pass so it composites on top
+    const edgeCanvas = document.createElement("canvas");
+    edgeCanvas.width = w;
+    edgeCanvas.height = h;
+    const edgeCtx = edgeCanvas.getContext("2d");
+    edgeCtx.putImageData(edgeData, 0, 0);
+    ctx.drawImage(edgeCanvas, 0, 0);
   }, [samMask, subjectAdj, subjectPreset, luts]);
 
   // Re-render subject overlay whenever mask or subject settings change
