@@ -164,13 +164,14 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
 
-  // ── SAM subject selection ──
+  // ── SAM subject selection (multi-layer) ──
   const [samActive, setSamActive] = useState(false);
   // 'idle' | 'loading' | 'encoding' | 'ready' | 'segmenting'
   const [samStatus, setSamStatus] = useState("idle");
-  const [samMask, setSamMask] = useState(null); // { data, width, height }
-  const [subjectPreset, setSubjectPreset] = useState("original");
-  const [subjectAdj, setSubjectAdj] = useState({ ...DEFAULT_ADJ });
+  // Each layer: { id, mask: {data,width,height}, preset: 'original', adj: {...} }
+  const [samLayers, setSamLayers] = useState([]);
+  const [activeLayerIdx, setActiveLayerIdx] = useState(0);
+  const [samAddingLayer, setSamAddingLayer] = useState(false);
 
   const canvasRef = useRef(null);
   const gpuRef = useRef(null);
@@ -377,19 +378,39 @@ export default function App() {
     return { r: buildTable(rCurve), g: buildTable(gCurve), b: buildTable(bCurve) };
   }, [adj, curves]);
 
+  const LAYER_COLORS = [[0,210,255],[255,100,200],[255,210,0],[100,255,150]];
+
+  const addMaskAsLayer = useCallback((maskData, maskWidth, maskHeight) => {
+    const mask = { data: maskData, width: maskWidth, height: maskHeight };
+    const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
+    setSamLayers((prev) => {
+      const next = [...prev, layer];
+      setActiveLayerIdx(next.length - 1);
+      return next;
+    });
+    setSamAddingLayer(false);
+  }, []);
+
+  const replaceMaskOnActiveLayer = useCallback((maskData, maskWidth, maskHeight) => {
+    const mask = { data: maskData, width: maskWidth, height: maskHeight };
+    setSamLayers((prev) => prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l));
+  }, [activeLayerIdx]);
+
   /* ── SAM: activate / deactivate ── */
   const activateSAM = useCallback(() => {
     setSamActive(true);
+    const sendEncode = (worker) => {
+      if (!originalDataRef.current) return;
+      setSamStatus("encoding");
+      const buf = originalDataRef.current.data.buffer.slice(0);
+      worker.postMessage(
+        { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
+        [buf],
+      );
+    };
+
     if (samWorkerRef.current) {
-      // Already created — just re-encode if image is ready
-      if (originalDataRef.current) {
-        setSamStatus("encoding");
-        const buf = originalDataRef.current.data.buffer.slice(0);
-        samWorkerRef.current.postMessage(
-          { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
-          [buf],
-        );
-      }
+      sendEncode(samWorkerRef.current);
       return;
     }
     setSamStatus("loading");
@@ -397,27 +418,33 @@ export default function App() {
     samWorkerRef.current = worker;
     worker.onmessage = ({ data }) => {
       switch (data.type) {
-        case "progress":
-          // status messages are already in samStatus via the loading/encoding states
-          break;
+        case "progress": break;
         case "modelReady":
-          if (originalDataRef.current) {
-            setSamStatus("encoding");
-            const buf = originalDataRef.current.data.buffer.slice(0);
-            worker.postMessage(
-              { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
-              [buf],
-            );
-          } else {
-            setSamStatus("ready");
-          }
+          sendEncode(worker);
           break;
         case "imageReady":
           setSamStatus("ready");
           break;
+        case "autoMask":
+          // Auto-selected subject — create first layer automatically
+          addMaskAsLayer(data.maskData, data.maskWidth, data.maskHeight);
+          break;
         case "maskReady":
-          setSamMask({ data: data.maskData, width: data.maskWidth, height: data.maskHeight });
           setSamStatus("ready");
+          // If adding a new layer, push; otherwise replace active
+          setSamLayers((prev) => {
+            // Check samAddingLayer via ref to avoid stale closure
+            if (prev.length === 0 || samAddingLayerRef.current) {
+              const mask = { data: data.maskData, width: data.maskWidth, height: data.maskHeight };
+              const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
+              const next = [...prev, layer];
+              setActiveLayerIdx(next.length - 1);
+              setSamAddingLayer(false);
+              return next;
+            }
+            const mask = { data: data.maskData, width: data.maskWidth, height: data.maskHeight };
+            return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l);
+          });
           break;
         case "error":
           console.error("SAM worker error:", data.message);
@@ -426,152 +453,148 @@ export default function App() {
       }
     };
     worker.postMessage({ type: "load" });
-  }, []);
+  }, [activeLayerIdx, addMaskAsLayer]);
+
+  // Ref to avoid stale closure in worker.onmessage
+  const samAddingLayerRef = useRef(false);
+  useEffect(() => { samAddingLayerRef.current = samAddingLayer; }, [samAddingLayer]);
 
   const deactivateSAM = useCallback(() => {
     setSamActive(false);
-    setSamMask(null);
+    setSamLayers([]);
+    setActiveLayerIdx(0);
     setSamStatus("idle");
-    // Clear overlay
     if (overlayCanvasRef.current) {
       const ctx = overlayCanvasRef.current.getContext("2d");
       ctx.clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height);
     }
   }, []);
 
-  /* ── SAM: render subject layer onto overlay canvas ── */
+  /* ── SAM: render all subject layers onto overlay canvas ── */
   const renderSubjectOverlay = useCallback(() => {
-    if (!samMask || !originalDataRef.current || !overlayCanvasRef.current) return;
+    if (!samLayers.length || !originalDataRef.current || !overlayCanvasRef.current) return;
     const { w, h } = dimsRef.current;
 
-    // Render subject version offscreen
+    // Create one offscreen renderer, reuse for all layers
     const offCanvas = document.createElement("canvas");
     offCanvas.width = w;
     offCanvas.height = h;
     let gpu;
-    try {
-      gpu = createRenderer(offCanvas);
-    } catch {
-      return; // WebGL 2 not available for offscreen canvas
-    }
+    try { gpu = createRenderer(offCanvas); } catch { return; }
     gpu.uploadImage(originalDataRef.current, w, h);
-
-    const lut = luts[subjectPreset];
-    if (lut) gpu.uploadLUT(lut.data, lut.size);
-
-    // Identity curve tables (no tone curve applied to subject layer)
     const identity = Array.from({ length: 256 }, (_, i) => i);
-    gpu.uploadCurveLUTs(identity, identity, identity);
 
-    const { intensity, highlights, shadows, temperature, tint, vibrance,
-            saturation, colorChrome, colorChromeFxBlue, grain, grainSize } = subjectAdj;
+    // Render each layer and collect pixels
+    const layerPixels = samLayers.map((layer) => {
+      const lut = luts[layer.preset];
+      if (lut) gpu.uploadLUT(lut.data, lut.size);
+      gpu.uploadCurveLUTs(identity, identity, identity);
 
-    gpu.render({
-      lutSize: lut ? lut.size : 0,
-      hasLut: !!lut,
-      intensity: intensity / 100,
-      highlights,
-      shadows,
-      temperature,
-      tint,
-      saturation,
-      vibrance,
-      colorChrome: colorChrome / 100,
-      colorChromeFxBlue: colorChromeFxBlue / 100,
-      vignette: 0,
-      grain: grain / 100,
-      grainAmp: 35 + (grainSize / 100) * 35,
-      grainCellSize: 0.4 + (grainSize / 100) * 0.6,
-      splitView: false,
-      splitPos: 50,
+      const { intensity, highlights, shadows, temperature, tint, vibrance,
+              saturation, colorChrome, colorChromeFxBlue, grain, grainSize } = layer.adj;
+      gpu.render({
+        lutSize: lut ? lut.size : 0, hasLut: !!lut,
+        intensity: intensity / 100, highlights, shadows, temperature, tint, saturation, vibrance,
+        colorChrome: colorChrome / 100, colorChromeFxBlue: colorChromeFxBlue / 100,
+        vignette: 0,
+        grain: grain / 100, grainAmp: 35 + (grainSize / 100) * 35,
+        grainCellSize: 0.4 + (grainSize / 100) * 0.6,
+        splitView: false, splitPos: 50,
+      });
+      return gpu.readPixels();
     });
-
-    // Read rendered pixels
-    const subjectImageData = gpu.readPixels();
     gpu.destroy();
 
-    // Apply mask — transparent where mask = 0
-    const { data: maskData } = samMask;
-    const out = new Uint8ClampedArray(subjectImageData.data);
-    for (let i = 0; i < w * h; i++) {
-      if (!maskData[i]) out[i * 4 + 3] = 0;
+    // Build combined mask (union of all layers) for dimming
+    const combined = new Uint8Array(w * h);
+    for (const layer of samLayers) {
+      const md = layer.mask.data;
+      for (let i = 0; i < w * h; i++) if (md[i]) combined[i] = 1;
     }
 
+    // Composite onto overlay canvas
     const overlayCanvas = overlayCanvasRef.current;
     overlayCanvas.width = w;
     overlayCanvas.height = h;
     const ctx = overlayCanvas.getContext("2d");
     ctx.clearRect(0, 0, w, h);
 
-    // 1. Strong dim on non-selected background
+    // 1. Dim non-selected background
     const dimData = ctx.createImageData(w, h);
     for (let i = 0; i < w * h; i++) {
-      if (!maskData[i]) {
-        dimData.data[i * 4 + 3] = 100; // noticeable dark veil on background
-      }
+      if (!combined[i]) dimData.data[i * 4 + 3] = 100;
     }
     ctx.putImageData(dimData, 0, 0);
 
-    // 2. Draw subject pixels on top (masked, fully opaque)
-    ctx.putImageData(new ImageData(out, w, h), 0, 0);
+    // 2. Composite each layer's pixels (last layer wins on overlap)
+    const comp = ctx.createImageData(w, h);
+    for (let li = 0; li < samLayers.length; li++) {
+      const md = samLayers[li].mask.data;
+      const px = layerPixels[li].data;
+      for (let i = 0; i < w * h; i++) {
+        if (md[i]) {
+          const pi = i * 4;
+          comp.data[pi] = px[pi];
+          comp.data[pi + 1] = px[pi + 1];
+          comp.data[pi + 2] = px[pi + 2];
+          comp.data[pi + 3] = 255;
+        }
+      }
+    }
+    ctx.putImageData(comp, 0, 0);
 
-    // 3. Build thick edge mask (2px radius) with cyan color
-    const edgeFlags = new Uint8Array(w * h);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const idx = y * w + x;
-        if (!maskData[idx]) continue;
-        let onEdge = false;
-        for (let dy = -2; dy <= 2 && !onEdge; dy++) {
-          for (let dx = -2; dx <= 2 && !onEdge; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const ny = y + dy, nx = x + dx;
-            if (ny < 0 || ny >= h || nx < 0 || nx >= w || !maskData[ny * w + nx]) onEdge = true;
+    // 3. Edge outlines per layer (different color per layer)
+    const edgeData = ctx.createImageData(w, h);
+    samLayers.forEach((layer, li) => {
+      const md = layer.mask.data;
+      const [cr, cg, cb] = LAYER_COLORS[li % LAYER_COLORS.length];
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
+          if (!md[idx]) continue;
+          let onEdge = false;
+          for (let dy = -2; dy <= 2 && !onEdge; dy++) {
+            for (let dx = -2; dx <= 2 && !onEdge; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const ny = y + dy, nx = x + dx;
+              if (ny < 0 || ny >= h || nx < 0 || nx >= w || !md[ny * w + nx]) onEdge = true;
+            }
+          }
+          if (onEdge) {
+            const pi = idx * 4;
+            edgeData.data[pi] = cr;
+            edgeData.data[pi + 1] = cg;
+            edgeData.data[pi + 2] = cb;
+            edgeData.data[pi + 3] = 220;
           }
         }
-        if (onEdge) edgeFlags[idx] = 1;
       }
-    }
-    const edgeData = ctx.createImageData(w, h);
-    for (let i = 0; i < w * h; i++) {
-      if (edgeFlags[i]) {
-        const pi = i * 4;
-        edgeData.data[pi] = 0;
-        edgeData.data[pi + 1] = 210;
-        edgeData.data[pi + 2] = 255;
-        edgeData.data[pi + 3] = 220;
-      }
-    }
+    });
 
-    // 4. Draw glow (blurred edge) then sharp edge on top
     const edgeCanvas = document.createElement("canvas");
     edgeCanvas.width = w;
     edgeCanvas.height = h;
     const edgeCtx = edgeCanvas.getContext("2d");
     edgeCtx.putImageData(edgeData, 0, 0);
-
     ctx.save();
     ctx.filter = "blur(4px)";
     ctx.globalAlpha = 0.55;
     ctx.drawImage(edgeCanvas, 0, 0);
     ctx.restore();
     ctx.drawImage(edgeCanvas, 0, 0);
-  }, [samMask, subjectAdj, subjectPreset, luts]);
+  }, [samLayers, luts, LAYER_COLORS]);
 
-  // Re-render subject overlay whenever mask or subject settings change
   useEffect(() => {
-    if (samMask) renderSubjectOverlay();
-  }, [samMask, renderSubjectOverlay]);
+    if (samLayers.length) renderSubjectOverlay();
+  }, [samLayers, renderSubjectOverlay]);
 
   /* ── SAM: handle click on canvas to trigger segmentation ── */
   const handleSamClick = useCallback((e) => {
     if (!samActive || samStatus !== "ready" || !samWorkerRef.current) return;
-    e.stopPropagation(); // don't open lightbox
+    e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
-    const scaleX = dimsRef.current.w / rect.width;
-    const scaleY = dimsRef.current.h / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
+    const x = (e.clientX - rect.left) / rect.width * dimsRef.current.w;
+    const y = (e.clientY - rect.top) / rect.height * dimsRef.current.h;
     setSamStatus("segmenting");
     samWorkerRef.current.postMessage({ type: "segment", x, y });
   }, [samActive, samStatus]);
@@ -1052,8 +1075,9 @@ export default function App() {
                 }}>
                   {samStatus === "loading" && "Downloading AI model (one time)…"}
                   {samStatus === "encoding" && "Analyzing image…"}
-                  {samStatus === "ready" && !samMask && "Click on your subject"}
-                  {samStatus === "ready" && samMask && "Click again to reselect"}
+                  {samStatus === "ready" && !samLayers.length && "Click on your subject"}
+                  {samStatus === "ready" && samLayers.length > 0 && !samAddingLayer && "Click to reselect · or Add Layer"}
+                  {samStatus === "ready" && samAddingLayer && "Click on another subject"}
                   {samStatus === "segmenting" && "Selecting…"}
                 </div>
               )}
@@ -1121,8 +1145,8 @@ export default function App() {
             })}
           </Panel>
 
-          {/* ── Subject Layer (SAM) ── */}
-          {samActive && samMask && (
+          {/* ── Subject Layers (SAM) ── */}
+          {samActive && samLayers.length > 0 && (
             <div className="sam-subject-panel" style={{
               margin: "8px 10px 4px",
               background: "linear-gradient(135deg, rgba(0,210,255,0.06) 0%, rgba(0,140,200,0.03) 100%)",
@@ -1144,38 +1168,95 @@ export default function App() {
                     display: "flex", alignItems: "center", justifyContent: "center",
                     fontSize: 9, fontWeight: 700, color: "#000", letterSpacing: "-0.02em",
                   }}>AI</div>
-                  <span style={{ fontSize: 11, fontWeight: 600, color: "#ccc", letterSpacing: "0.01em" }}>Subject Layer</span>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#ccc", letterSpacing: "0.01em" }}>Subject Layers</span>
                 </div>
-                <button
-                  onClick={() => { setSamMask(null); if (overlayCanvasRef.current) { overlayCanvasRef.current.getContext("2d").clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height); } }}
-                  style={{
-                    padding: "3px 8px", fontSize: 9, fontWeight: 500, fontFamily: "inherit",
-                    background: "rgba(255,255,255,0.06)", color: "#888",
-                    border: "1px solid rgba(255,255,255,0.08)", borderRadius: 4,
-                    cursor: "pointer", letterSpacing: "0.02em",
-                  }}
-                >Clear</button>
-              </div>
-              {/* Body */}
-              <div style={{ padding: "10px 12px 12px" }}>
-                <div style={{ fontSize: 10, color: "rgba(0,210,255,0.5)", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6, fontWeight: 500 }}>Film Simulation</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
-                  <button onClick={() => setSubjectPreset("original")} style={presetBtn(subjectPreset === "original")}>None</button>
-                  {visibleLutNames.map((name) => (
-                    <button key={name} onClick={() => setSubjectPreset(name)} style={presetBtn(subjectPreset === name)}>{name}</button>
-                  ))}
+                <div style={{ display: "flex", gap: 4 }}>
+                  <button
+                    onClick={() => setSamAddingLayer(true)}
+                    style={{
+                      padding: "3px 8px", fontSize: 9, fontWeight: 600, fontFamily: "inherit",
+                      background: samAddingLayer ? "rgba(0,210,255,0.15)" : "rgba(255,255,255,0.06)",
+                      color: samAddingLayer ? "#00d2ff" : "#888",
+                      border: `1px solid ${samAddingLayer ? "rgba(0,210,255,0.3)" : "rgba(255,255,255,0.08)"}`,
+                      borderRadius: 4, cursor: "pointer", letterSpacing: "0.02em",
+                    }}
+                  >+ Add</button>
+                  <button
+                    onClick={() => { setSamLayers([]); setActiveLayerIdx(0); if (overlayCanvasRef.current) overlayCanvasRef.current.getContext("2d").clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height); }}
+                    style={{
+                      padding: "3px 8px", fontSize: 9, fontWeight: 500, fontFamily: "inherit",
+                      background: "rgba(255,255,255,0.06)", color: "#888",
+                      border: "1px solid rgba(255,255,255,0.08)", borderRadius: 4,
+                      cursor: "pointer", letterSpacing: "0.02em",
+                    }}
+                  >Clear All</button>
                 </div>
-                <Slider label="Intensity" value={subjectAdj.intensity} min={0} max={100} defaultValue={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, intensity: v }))} format={pctFmt} />
-                <Slider label="Highlights" value={subjectAdj.highlights} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, highlights: v }))} format={signFmt} />
-                <Slider label="Shadows" value={subjectAdj.shadows} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, shadows: v }))} format={signFmt} />
-                <Slider label="Temperature" value={subjectAdj.temperature} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, temperature: v }))} format={signFmt} />
-                <Slider label="Saturation" value={subjectAdj.saturation} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, saturation: v }))} format={signFmt} />
               </div>
+
+              {/* Layer tabs */}
+              {samLayers.length > 1 && (
+                <div style={{ display: "flex", gap: 0, borderBottom: "1px solid rgba(0,210,255,0.1)" }}>
+                  {samLayers.map((layer, li) => {
+                    const [cr, cg, cb] = LAYER_COLORS[li % LAYER_COLORS.length];
+                    const isActive = li === activeLayerIdx;
+                    return (
+                      <button
+                        key={layer.id}
+                        onClick={() => setActiveLayerIdx(li)}
+                        style={{
+                          flex: 1, padding: "6px 8px", fontSize: 10, fontWeight: isActive ? 600 : 400,
+                          fontFamily: "inherit", cursor: "pointer",
+                          background: isActive ? `rgba(${cr},${cg},${cb},0.1)` : "transparent",
+                          color: isActive ? `rgb(${cr},${cg},${cb})` : "#666",
+                          border: "none", borderBottom: isActive ? `2px solid rgb(${cr},${cg},${cb})` : "2px solid transparent",
+                          display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
+                        }}
+                      >
+                        <div style={{ width: 8, height: 8, borderRadius: 2, background: `rgb(${cr},${cg},${cb})`, opacity: isActive ? 1 : 0.4 }} />
+                        Layer {li + 1}
+                        {samLayers.length > 1 && (
+                          <span
+                            onClick={(e) => { e.stopPropagation(); setSamLayers((prev) => { const next = prev.filter((_, i) => i !== li); if (activeLayerIdx >= next.length) setActiveLayerIdx(Math.max(0, next.length - 1)); return next; }); }}
+                            style={{ fontSize: 9, color: "#555", cursor: "pointer", marginLeft: 2 }}
+                          >&times;</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Active layer controls */}
+              {samLayers[activeLayerIdx] && (() => {
+                const layer = samLayers[activeLayerIdx];
+                const setLayerField = (field, value) => {
+                  setSamLayers((prev) => prev.map((l, i) => i === activeLayerIdx ? { ...l, adj: { ...l.adj, [field]: value } } : l));
+                };
+                const setLayerPreset = (preset) => {
+                  setSamLayers((prev) => prev.map((l, i) => i === activeLayerIdx ? { ...l, preset } : l));
+                };
+                return (
+                  <div style={{ padding: "10px 12px 12px" }}>
+                    <div style={{ fontSize: 10, color: "rgba(0,210,255,0.5)", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6, fontWeight: 500 }}>Film Simulation</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+                      <button onClick={() => setLayerPreset("original")} style={presetBtn(layer.preset === "original")}>None</button>
+                      {visibleLutNames.map((name) => (
+                        <button key={name} onClick={() => setLayerPreset(name)} style={presetBtn(layer.preset === name)}>{name}</button>
+                      ))}
+                    </div>
+                    <Slider label="Intensity" value={layer.adj.intensity} min={0} max={100} defaultValue={100} onChange={(v) => setLayerField("intensity", v)} format={pctFmt} />
+                    <Slider label="Highlights" value={layer.adj.highlights} min={-100} max={100} onChange={(v) => setLayerField("highlights", v)} format={signFmt} />
+                    <Slider label="Shadows" value={layer.adj.shadows} min={-100} max={100} onChange={(v) => setLayerField("shadows", v)} format={signFmt} />
+                    <Slider label="Temperature" value={layer.adj.temperature} min={-100} max={100} onChange={(v) => setLayerField("temperature", v)} format={signFmt} />
+                    <Slider label="Saturation" value={layer.adj.saturation} min={-100} max={100} onChange={(v) => setLayerField("saturation", v)} format={signFmt} />
+                  </div>
+                );
+              })()}
             </div>
           )}
 
           {/* Film Simulation */}
-          <Panel title={samMask && samActive ? "Background Film Simulation" : "Film Simulation"}>
+          <Panel title={samLayers.length > 0 && samActive ? "Background Film Simulation" : "Film Simulation"}>
             {lutNames.length === 0 ? (
               <p style={{ fontSize: 11, color: "#555", margin: 0 }}>Loading LUTs...</p>
             ) : (
