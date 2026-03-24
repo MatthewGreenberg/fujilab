@@ -2,7 +2,7 @@
 
 A browser-based photo editor that applies Fujifilm film simulations to your images using WebGL.
 
-[**Try it live →**](https://fujilab.vercel.app)
+[**Try it live →**](https://fujilab.vercel.app) · [**GitHub →**](https://github.com/MatthewGreenberg/fujilab)
 
 ## Features
 
