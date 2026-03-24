@@ -404,7 +404,11 @@ input[type="range"]::-moz-range-track {
   }
 
   .app-sam-panel {
-    display: none;
+    display: none !important;
+  }
+
+  .sam-btn {
+    display: none !important;
   }
 
   .app-canvas-area {

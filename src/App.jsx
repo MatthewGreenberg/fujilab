@@ -478,7 +478,7 @@ export default function App() {
     throw new Error("SAM3 request timed out");
   }, [getImageDataUri, decodeMaskFromUrl]);
 
-  /* ── SAM: activate — auto-detect subject via client-side RMBG model ── */
+  /* ── SAM: activate — auto-detect subject via client-side RMBG ── */
   const activateSAM = useCallback(async () => {
     setSamActive(true);
     setSamStatus("loading");
@@ -492,21 +492,16 @@ export default function App() {
       const imageData = originalDataRef.current;
       if (!imageData) throw new Error("No image loaded");
 
-      // Convert ImageData to RawImage for the model
       const t1 = performance.now();
       const rawImg = new RawImage(new Uint8ClampedArray(imageData.data), w, h, 4);
-
-      // Run inference
       const { pixel_values } = await processor(rawImg);
       const { output } = await model({ input: pixel_values });
 
-      // Extract alpha matte — output is [1, 1, H, W] tensor with values 0-1
-      const maskTensor = output[0][0]; // [H, W]
+      const maskTensor = output[0][0];
       const mh = maskTensor.dims[0];
       const mw = maskTensor.dims[1];
-      const maskData = maskTensor.data; // Float32Array, values 0-1
+      const maskData = maskTensor.data;
 
-      // Convert to 0-255 alpha values at display resolution
       const alpha = new Uint8Array(w * h);
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
@@ -861,6 +856,8 @@ export default function App() {
       setImageLoaded(true);
       setProcessing(false);
       setSamLayers([]);
+      // Preload RMBG model in background so it's ready when needed
+      loadRMBG().catch(() => {});
       setSamActive(false);
       setSamStatus("idle");
       setSamAddingLayer(false);
@@ -1347,6 +1344,9 @@ export default function App() {
               onMouseUp={brushMode ? handleBrushUp : undefined}
               onMouseLeave={() => { if (brushMode) { handleBrushUp(); setBrushCursor(null); } }}
               onMouseEnter={(e) => { if (brushMode) { const rect = e.currentTarget.getBoundingClientRect(); setBrushCursor({ x: e.clientX - rect.left, y: e.clientY - rect.top }); } }}
+              onTouchStart={brushMode ? (e) => { const t = e.touches[0]; handleBrushDown({ clientX: t.clientX, clientY: t.clientY, currentTarget: e.currentTarget, preventDefault: () => e.preventDefault(), stopPropagation: () => e.stopPropagation() }); } : undefined}
+              onTouchMove={brushMode ? (e) => { const t = e.touches[0]; if (isPainting) paintStroke({ clientX: t.clientX, clientY: t.clientY }, e.currentTarget); } : undefined}
+              onTouchEnd={brushMode ? handleBrushUp : undefined}
               style={{
                 position: "relative",
                 aspectRatio: `${dimsRef.current.w} / ${dimsRef.current.h}`,
