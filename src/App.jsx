@@ -201,6 +201,13 @@ export default function App() {
   const [isPainting, setIsPainting] = useState(false);
   const [brushCursor, setBrushCursor] = useState(null); // { x, y } relative to canvas container
 
+  // ── Zoom/pan state ──
+  const zoomRef = useRef({ scale: 1, tx: 0, ty: 0 });
+  const pinchRef = useRef({ startDist: 0, startScale: 1, startTx: 0, startTy: 0, cx: 0, cy: 0 });
+  const panRef = useRef({ startX: 0, startY: 0, startTx: 0, startTy: 0 });
+  const lastTapRef = useRef(0);
+  const [zoomed, setZoomed] = useState(false); // just for cursor/UI hints
+
   const canvasRef = useRef(null);
   const gpuRef = useRef(null);
   const originalDataRef = useRef(null);
@@ -1169,6 +1176,125 @@ export default function App() {
     setLightboxUrl(canvasRef.current.toDataURL("image/jpeg", 0.95));
   }, [imageLoaded]);
 
+  // ── Zoom/pan helpers ──
+  const applyZoom = useCallback((animated) => {
+    const el = splitRef.current;
+    if (!el) return;
+    const { scale, tx, ty } = zoomRef.current;
+    el.style.transition = animated ? "transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)" : "none";
+    el.style.transform = scale <= 1.01 ? "" : `scale(${scale}) translate(${tx}px, ${ty}px)`;
+    el.style.zIndex = scale > 1.01 ? "5" : "";
+    setZoomed(scale > 1.01);
+  }, []);
+
+  const clampPan = useCallback(() => {
+    const el = splitRef.current;
+    if (!el) return;
+    const { scale } = zoomRef.current;
+    if (scale <= 1) { zoomRef.current.tx = 0; zoomRef.current.ty = 0; return; }
+    const rect = el.getBoundingClientRect();
+    const maxTx = (rect.width * (scale - 1)) / (2 * scale);
+    const maxTy = (rect.height * (scale - 1)) / (2 * scale);
+    zoomRef.current.tx = Math.max(-maxTx, Math.min(maxTx, zoomRef.current.tx));
+    zoomRef.current.ty = Math.max(-maxTy, Math.min(maxTy, zoomRef.current.ty));
+  }, []);
+
+  const resetZoom = useCallback(() => {
+    zoomRef.current = { scale: 1, tx: 0, ty: 0 };
+    applyZoom(true);
+  }, [applyZoom]);
+
+  const handleImageTouchStart = useCallback((e) => {
+    if (brushMode || samActive) return;
+    const touches = e.touches;
+    if (touches.length === 2) {
+      // Pinch start
+      e.preventDefault();
+      const dx = touches[1].clientX - touches[0].clientX;
+      const dy = touches[1].clientY - touches[0].clientY;
+      pinchRef.current = {
+        startDist: Math.hypot(dx, dy),
+        startScale: zoomRef.current.scale,
+        startTx: zoomRef.current.tx,
+        startTy: zoomRef.current.ty,
+        cx: (touches[0].clientX + touches[1].clientX) / 2,
+        cy: (touches[0].clientY + touches[1].clientY) / 2,
+      };
+    } else if (touches.length === 1 && zoomRef.current.scale > 1.01) {
+      // Pan start (only when zoomed)
+      e.preventDefault();
+      panRef.current = {
+        startX: touches[0].clientX,
+        startY: touches[0].clientY,
+        startTx: zoomRef.current.tx,
+        startTy: zoomRef.current.ty,
+      };
+    }
+  }, [brushMode, samActive]);
+
+  const handleImageTouchMove = useCallback((e) => {
+    if (brushMode || samActive) return;
+    const touches = e.touches;
+    if (touches.length === 2) {
+      e.preventDefault();
+      const dx = touches[1].clientX - touches[0].clientX;
+      const dy = touches[1].clientY - touches[0].clientY;
+      const dist = Math.hypot(dx, dy);
+      const newScale = Math.max(1, Math.min(5, pinchRef.current.startScale * (dist / pinchRef.current.startDist)));
+      zoomRef.current.scale = newScale;
+      clampPan();
+      applyZoom(false);
+    } else if (touches.length === 1 && zoomRef.current.scale > 1.01) {
+      e.preventDefault();
+      const dx = touches[0].clientX - panRef.current.startX;
+      const dy = touches[0].clientY - panRef.current.startY;
+      zoomRef.current.tx = panRef.current.startTx + dx / zoomRef.current.scale;
+      zoomRef.current.ty = panRef.current.startTy + dy / zoomRef.current.scale;
+      clampPan();
+      applyZoom(false);
+    }
+  }, [brushMode, samActive, clampPan, applyZoom]);
+
+  const handleImageTouchEnd = useCallback((e) => {
+    if (brushMode || samActive) return;
+    // Snap to 1x if barely zoomed
+    if (e.touches.length === 0 && zoomRef.current.scale < 1.1) {
+      resetZoom();
+      return;
+    }
+    // Double-tap detection
+    if (e.touches.length === 0 && e.changedTouches.length === 1) {
+      const now = Date.now();
+      if (now - lastTapRef.current < 300) {
+        // Double tap — toggle between 1x and 2.5x
+        if (zoomRef.current.scale > 1.1) {
+          resetZoom();
+        } else {
+          const rect = splitRef.current.getBoundingClientRect();
+          const tapX = e.changedTouches[0].clientX - rect.left;
+          const tapY = e.changedTouches[0].clientY - rect.top;
+          zoomRef.current.scale = 2.5;
+          // Center zoom on tap point
+          zoomRef.current.tx = (rect.width / 2 - tapX) / 2.5;
+          zoomRef.current.ty = (rect.height / 2 - tapY) / 2.5;
+          clampPan();
+          applyZoom(true);
+        }
+        lastTapRef.current = 0;
+        return;
+      }
+      lastTapRef.current = now;
+    }
+  }, [brushMode, samActive, resetZoom, clampPan, applyZoom]);
+
+  // Reset zoom when image changes
+  useEffect(() => {
+    if (splitRef.current) {
+      zoomRef.current = { scale: 1, tx: 0, ty: 0 };
+      applyZoom(false);
+    }
+  }, [imageLoaded, applyZoom]);
+
   useEffect(() => {
     if (!lightboxUrl) return;
     const onKey = (e) => { if (e.key === "Escape") setLightboxUrl(null); };
@@ -1330,7 +1456,7 @@ export default function App() {
           ) : (
             <div
               ref={splitRef}
-              onClick={samActive && samStatus === "ready" && !brushMode ? handleSamClick : (!splitView && !samActive ? openLightbox : undefined)}
+              onClick={samActive && samStatus === "ready" && !brushMode ? handleSamClick : (!splitView && !samActive && !zoomed ? openLightbox : undefined)}
               onMouseDown={brushMode ? handleBrushDown : undefined}
               onMouseMove={(e) => {
                 if (brushMode) {
@@ -1342,9 +1468,13 @@ export default function App() {
               onMouseUp={brushMode ? handleBrushUp : undefined}
               onMouseLeave={() => { if (brushMode) { handleBrushUp(); setBrushCursor(null); } }}
               onMouseEnter={(e) => { if (brushMode) { const rect = e.currentTarget.getBoundingClientRect(); setBrushCursor({ x: e.clientX - rect.left, y: e.clientY - rect.top }); } }}
-              onTouchStart={brushMode ? (e) => { const t = e.touches[0]; handleBrushDown({ clientX: t.clientX, clientY: t.clientY, currentTarget: e.currentTarget, preventDefault: () => e.preventDefault(), stopPropagation: () => e.stopPropagation() }); } : undefined}
-              onTouchMove={brushMode ? (e) => { const t = e.touches[0]; if (isPainting) paintStroke({ clientX: t.clientX, clientY: t.clientY }, e.currentTarget); } : undefined}
-              onTouchEnd={brushMode ? handleBrushUp : undefined}
+              onTouchStart={brushMode
+                ? (e) => { const t = e.touches[0]; handleBrushDown({ clientX: t.clientX, clientY: t.clientY, currentTarget: e.currentTarget, preventDefault: () => e.preventDefault(), stopPropagation: () => e.stopPropagation() }); }
+                : handleImageTouchStart}
+              onTouchMove={brushMode
+                ? (e) => { const t = e.touches[0]; if (isPainting) paintStroke({ clientX: t.clientX, clientY: t.clientY }, e.currentTarget); }
+                : handleImageTouchMove}
+              onTouchEnd={brushMode ? handleBrushUp : handleImageTouchEnd}
               style={{
                 position: "relative",
                 aspectRatio: `${dimsRef.current.w} / ${dimsRef.current.h}`,
@@ -1352,6 +1482,8 @@ export default function App() {
                 maxHeight: "100%",
                 cursor: brushMode ? "none" : samActive && samStatus === "ready" ? "crosshair" : splitView ? "default" : "zoom-in",
                 flexShrink: 0,
+                touchAction: "none",
+                transformOrigin: "center center",
               }}
             >
               <canvas ref={canvasCallbackRef} style={{ display: "block", width: "100%", height: "100%" }} />
