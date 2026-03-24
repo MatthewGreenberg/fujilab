@@ -411,57 +411,43 @@ export default function App() {
     });
   }, []);
 
-  /* ── SAM: call Replicate API — returns all individual masks ── */
-  const callSamAPI = useCallback(async () => {
-    const image = getImageDataUri();
-    if (!image) throw new Error("No image loaded");
+  /* ── SAM: call fal.ai SAM3 API via serverless proxy ── */
+  const callSamAPI = useCallback(async ({ point_prompts, prompt }) => {
+    const image_url = getImageDataUri();
+    if (!image_url) throw new Error("No image loaded");
+
+    const body = { image_url };
+    if (point_prompts) body.point_prompts = point_prompts;
+    else if (prompt) body.prompt = prompt;
 
     const resp = await fetch("/api/sam", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image }),
+      body: JSON.stringify(body),
     });
-    let result = await resp.json();
 
-    // Poll if not yet complete
-    while (result.status && result.status !== "succeeded" && result.status !== "failed") {
-      await new Promise((r) => setTimeout(r, 1000));
-      const poll = await fetch(`/api/sam?pollUrl=${encodeURIComponent(result.pollUrl)}`);
-      result = await poll.json();
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `API error ${resp.status}`);
     }
 
-    if (result.status === "failed" || result.error) {
-      throw new Error(result.error || "SAM prediction failed");
-    }
+    const result = await resp.json();
+    const maskUrl = result.masks?.[0]?.url || result.image?.url;
+    if (!maskUrl) throw new Error("No mask in API response");
 
-    const { individual_masks } = result.output || {};
-    if (!individual_masks?.length) throw new Error("No masks in API response");
-
-    // Decode all masks, filter by coverage (keep subject-sized ones)
-    const decoded = await Promise.all(individual_masks.map((url) => decodeMaskFromUrl(url)));
-    return decoded.filter((m) => {
-      const coverage = m.data.reduce((s, v) => s + v, 0) / m.data.length;
-      return coverage > 0.01 && coverage < 0.6;
-    }).sort((a, b) => {
-      // Sort by size descending — biggest subject first
-      const ca = a.data.reduce((s, v) => s + v, 0);
-      const cb = b.data.reduce((s, v) => s + v, 0);
-      return cb - ca;
-    });
+    return decodeMaskFromUrl(maskUrl);
   }, [getImageDataUri, decodeMaskFromUrl]);
 
-  /* ── SAM: activate / deactivate ── */
-  const samMasksRef = useRef([]); // all decoded masks from API
+  /* ── SAM: activate — auto-select subject via text prompt ── */
   const activateSAM = useCallback(async () => {
     setSamActive(true);
     setSamStatus("segmenting");
     try {
-      const masks = await callSamAPI();
-      samMasksRef.current = masks;
-
-      // Auto-create first layer from the largest subject mask
-      if (masks.length > 0) {
-        const layer = { id: Date.now(), mask: masks[0], preset: "original", adj: { ...DEFAULT_ADJ } };
+      // Use text prompt to find the main subject — much better than point grid
+      const mask = await callSamAPI({ prompt: "main subject" });
+      const coverage = mask.data.reduce((s, v) => s + v, 0) / mask.data.length;
+      if (coverage > 0.01 && coverage < 0.6) {
+        const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
         setSamLayers([layer]);
         setActiveLayerIdx(0);
       }
@@ -601,74 +587,35 @@ export default function App() {
     if (samLayers.length) renderSubjectOverlay();
   }, [samLayers, renderSubjectOverlay]);
 
-  /* ── SAM: handle click — find best pre-computed mask at click point ── */
-  const handleSamClick = useCallback((e) => {
+  /* ── SAM: handle click — call SAM3 API with point prompt ── */
+  const handleSamClick = useCallback(async (e) => {
     if (!samActive || samStatus !== "ready") return;
     e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = Math.round((e.clientX - rect.left) / rect.width * dimsRef.current.w);
-    const clickY = Math.round((e.clientY - rect.top) / rect.height * dimsRef.current.h);
+    const x = Math.round((e.clientX - rect.left) / rect.width * dimsRef.current.w);
+    const y = Math.round((e.clientY - rect.top) / rect.height * dimsRef.current.h);
 
-    const masks = samMasksRef.current;
-    if (!masks.length) return;
+    setSamStatus("segmenting");
+    try {
+      const mask = await callSamAPI({
+        point_prompts: [{ x, y, label: 1 }],
+      });
 
-    // Precompute mask sizes (cached on first click)
-    if (!masks[0]._size) {
-      for (const m of masks) m._size = m.data.reduce((s, v) => s + v, 0);
-    }
-
-    // Find the largest mask that contains the clicked point (whole subject, not parts)
-    const totalPixels = dimsRef.current.w * dimsRef.current.h;
-    let best = null;
-    let bestSize = 0;
-    for (const m of masks) {
-      const mx = Math.min(m.width - 1, Math.max(0, Math.round(clickX / dimsRef.current.w * m.width)));
-      const my = Math.min(m.height - 1, Math.max(0, Math.round(clickY / dimsRef.current.h * m.height)));
-      const idx = my * m.width + mx;
-      // Prefer the largest mask that isn't the whole image (< 55% coverage)
-      const coverageRatio = m._size / (m.width * m.height);
-      if (m.data[idx] && m._size > bestSize && coverageRatio < 0.55) {
-        best = m;
-        bestSize = m._size;
-      }
-    }
-
-    // Fallback: if no mask at exact pixel, search a radius around the click
-    if (!best) {
-      const searchRadius = 20;
-      for (const m of masks) {
-        const sx = clickX / dimsRef.current.w * m.width;
-        const sy = clickY / dimsRef.current.h * m.height;
-        const coverageRatio = m._size / (m.width * m.height);
-        for (let dy = -searchRadius; dy <= searchRadius && !best; dy += 4) {
-          for (let dx = -searchRadius; dx <= searchRadius && !best; dx += 4) {
-            const px = Math.min(m.width - 1, Math.max(0, Math.round(sx + dx)));
-            const py = Math.min(m.height - 1, Math.max(0, Math.round(sy + dy)));
-            if (m.data[py * m.width + px] && m._size > bestSize && coverageRatio < 0.55) {
-              best = m;
-              bestSize = m._size;
-            }
-          }
+      setSamLayers((prev) => {
+        if (prev.length === 0 || samAddingLayer) {
+          const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
+          const next = [...prev, layer];
+          setActiveLayerIdx(next.length - 1);
+          setSamAddingLayer(false);
+          return next;
         }
-      }
+        return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l);
+      });
+    } catch (err) {
+      console.error("SAM API error:", err.message);
     }
-
-    if (!best) return;
-
-    // Deep copy the mask to ensure React detects the change
-    const maskCopy = { data: [...best.data], width: best.width, height: best.height };
-
-    setSamLayers((prev) => {
-      if (prev.length === 0 || samAddingLayer) {
-        const layer = { id: Date.now(), mask: maskCopy, preset: "original", adj: { ...DEFAULT_ADJ } };
-        const next = [...prev, layer];
-        setActiveLayerIdx(next.length - 1);
-        setSamAddingLayer(false);
-        return next;
-      }
-      return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask: maskCopy } : l);
-    });
-  }, [samActive, samStatus, samAddingLayer, activeLayerIdx]);
+    setSamStatus("ready");
+  }, [samActive, samStatus, samAddingLayer, activeLayerIdx, callSamAPI]);
 
   /* ── GPU render pass ── */
   const processImage = useCallback(() => {
