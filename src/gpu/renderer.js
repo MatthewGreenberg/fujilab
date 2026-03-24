@@ -303,27 +303,25 @@ void main() {
   color.b = texture(u_curves, vec2((color.b * 255.0 + 0.5) / 256.0, 2.5 / 3.0)).r;
 
   // 3. Color Chrome / FX Blue
+  //    Fade to zero in highlights to prevent color blowout in bright areas.
   if (u_colorChrome > 0.0 || u_colorChromeFxBlue > 0.0) {
     float mx = max(color.r, max(color.g, color.b));
     float mn = min(color.r, min(color.g, color.b));
     float sat = mx > 0.0 ? (mx - mn) / mx : 0.0;
     float hue = rgbHue(color);
     float l = luma(color);
+    float hlAtten = 1.0 - smoothstep(0.6, 0.95, l); // fade out in highlights
 
-    // Color Chrome: enrich warm tones (reds/oranges/yellows/greens).
-    // Pushes each pixel away from its luma grey point, increasing colour density.
-    // Low sat threshold (0.15) ensures it works on post-LUT desaturated images.
     if (u_colorChrome > 0.0 && sat > 0.15 && hue >= 0.0 && hue < 200.0) {
       float hueMask = hue < 140.0 ? 1.0 : max(0.0, 1.0 - (hue - 140.0) / 60.0);
-      float str = sat * u_colorChrome * hueMask;
+      float str = sat * u_colorChrome * hueMask * hlAtten;
       color = (color + (color - vec3(l)) * str * 0.8) * (1.0 - str * 0.07);
     }
-    // Color Chrome FX Blue: enrich blue/cyan/purple tones with the same approach.
     if (u_colorChromeFxBlue > 0.0 && sat > 0.15 && hue >= 0.0) {
       float dist = min(abs(hue - 235.0), 360.0 - abs(hue - 235.0));
       if (dist < 55.0) {
         float mask = cos((dist / 55.0) * 1.5707963);
-        float str = mask * sat * u_colorChromeFxBlue;
+        float str = mask * sat * u_colorChromeFxBlue * hlAtten;
         color = (color + (color - vec3(l)) * str * 0.8) * (1.0 - str * 0.12);
       }
     }
@@ -342,26 +340,33 @@ void main() {
     }
   }
 
-  // 5. Temperature / Tint
+  // 5. Temperature / Tint — attenuate in highlights
   if (u_temperature != 0.0 || u_tint != 0.0) {
     float t = u_temperature / 100.0;
-    color.r += t * 0.3;
-    color.g += (u_tint / 100.0) * 0.25 - t * 0.1;
-    color.b -= t * 0.3;
+    float l = luma(color);
+    float hlAtten = 1.0 - smoothstep(0.7, 1.0, l);
+    color.r += t * 0.3 * hlAtten;
+    color.g += ((u_tint / 100.0) * 0.25 - t * 0.1) * hlAtten;
+    color.b -= t * 0.3 * hlAtten;
   }
 
-  // 6. Saturation / Vibrance
-  if (u_saturation != 0.0) {
-    float avg = dot(color, vec3(1.0 / 3.0));
-    color = vec3(avg) + (color - vec3(avg)) * (1.0 + u_saturation / 100.0);
-  }
-  if (u_vibrance != 0.0) {
-    float mx = max(color.r, max(color.g, color.b));
-    float mn = min(color.r, min(color.g, color.b));
-    float sat = mx > 0.0 ? (mx - mn) / mx : 0.0;
-    float vf = 1.0 + (u_vibrance / 100.0) * (1.0 - sat);
-    float avg = dot(color, vec3(1.0 / 3.0));
-    color = vec3(avg) + (color - vec3(avg)) * vf;
+  // 6. Saturation / Vibrance — attenuate in highlights
+  {
+    float l = luma(color);
+    float hlAtten = 1.0 - smoothstep(0.7, 1.0, l);
+    if (u_saturation != 0.0) {
+      float avg = dot(color, vec3(1.0 / 3.0));
+      float sf = 1.0 + (u_saturation / 100.0) * hlAtten;
+      color = vec3(avg) + (color - vec3(avg)) * sf;
+    }
+    if (u_vibrance != 0.0) {
+      float mx = max(color.r, max(color.g, color.b));
+      float mn = min(color.r, min(color.g, color.b));
+      float sat = mx > 0.0 ? (mx - mn) / mx : 0.0;
+      float vf = 1.0 + (u_vibrance / 100.0) * (1.0 - sat) * hlAtten;
+      float avg = dot(color, vec3(1.0 / 3.0));
+      color = vec3(avg) + (color - vec3(avg)) * vf;
+    }
   }
 
   // 7. Vignette
@@ -377,6 +382,15 @@ void main() {
     float w = exp(-((l - 0.4) * (l - 0.4)) / 0.1225);
     float n = (grainNoise(gl_FragCoord.xy / u_grainCellSize) - 0.5) * 2.0;
     color += n * (u_grainAmp / 255.0) * u_grain * w;
+  }
+
+  // Highlight desaturation: mimic film's natural shoulder behavior.
+  // Only triggers on near-white pixels (high luminance), not vivid
+  // saturated colors that happen to have one bright channel.
+  float hl = luma(color);
+  if (hl > 0.85) {
+    float desat = smoothstep(0.85, 1.1, hl);
+    color = mix(color, vec3(hl), desat);
   }
 
   color = clamp(color, 0.0, 1.0);

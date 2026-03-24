@@ -1,7 +1,27 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { parse3DL, parseCube } from "./lut"; // applyLUT no longer needed — GPU does trilinear interpolation
+import { parse3DL, parseCube } from "./lut";
 import CurveEditor, { buildCurveLUT } from "./CurveEditor";
 import { createRenderer, isWebGL2Supported } from "./gpu/renderer";
+import LibRaw from "libraw-wasm";
+
+/* Decode a RAF file's raw sensor data via LibRaw-Wasm. Returns ImageData + dimensions. */
+async function decodeRaf(arrayBuffer) {
+  const raw = new LibRaw();
+  await raw.open(new Uint8Array(arrayBuffer), {
+    useCameraWb: true,
+    outputBps: 8,
+    halfSize: false,
+  });
+  const meta = await raw.metadata();
+  const rgb = await raw.imageData(); // Uint8Array, 3 bytes per pixel (RGB)
+  const w = meta.width, h = meta.height;
+  // Convert RGB → RGBA for ImageData
+  const rgba = new Uint8Array(w * h * 4);
+  for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+    rgba[j] = rgb[i]; rgba[j + 1] = rgb[i + 1]; rgba[j + 2] = rgb[i + 2]; rgba[j + 3] = 255;
+  }
+  return { imageData: new ImageData(new Uint8ClampedArray(rgba.buffer), w, h), w, h };
+}
 
 const BUNDLED_LUTS = [
   "Fuji XTrans III - Acros.3dl",
@@ -103,7 +123,7 @@ const RECIPES = [
     category: "Cinematic",
     description: "Tungsten cinema film &middot; cool blue cast",
     filmSim: "Pro Neg Std",
-    adj: { intensity: 90, exposure: 0.1, contrast: -10, shadows: 40, temperature: -30, tint: -10, saturation: 20, vibrance: 15, highlightRolloff: 40, colorChrome: 70, colorChromeFxBlue: 35, grain: 40, grainSize: 75 },
+    adj: { intensity: 90, exposure: 0.1, contrast: -10, highlights: -15, shadows: 30, temperature: -12, tint: -4, saturation: 12, vibrance: 10, highlightRolloff: 55, colorChrome: 50, colorChromeFxBlue: 35, grain: 35, grainSize: 75 },
   },
   {
     name: "Vibrant Arizona",
@@ -260,6 +280,7 @@ export default function App() {
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [loadingLuts, setLoadingLuts] = useState(true);
+  const [decodingRaw, setDecodingRaw] = useState(false);
   const [sheetDragging, setSheetDragging] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState(null);
 
@@ -427,41 +448,107 @@ export default function App() {
     if (imageLoaded) processImage();
   }, [imageLoaded, processImage]);
 
+  /* ── Extract embedded JPEG from a Fujifilm .RAF file ── */
+  const extractRafJpeg = useCallback((arrayBuffer) => {
+    const view = new DataView(arrayBuffer);
+    const magic = String.fromCharCode(...new Uint8Array(arrayBuffer, 0, 16));
+    if (!magic.startsWith("FUJIFILMCCD-RAW")) return null;
+    // Bytes 84-87: JPEG offset (big-endian), 88-91: JPEG length
+    const jpegOffset = view.getUint32(84, false);
+    const jpegLength = view.getUint32(88, false);
+    if (jpegOffset === 0 || jpegLength === 0 || jpegOffset + jpegLength > arrayBuffer.byteLength) return null;
+    return new Blob([arrayBuffer.slice(jpegOffset, jpegOffset + jpegLength)], { type: "image/jpeg" });
+  }, []);
+
+  /* ── Load an image onto the canvas and GPU ── */
+  const loadImageFromBlob = useCallback((blob) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const maxW = Math.min(1400, img.naturalWidth);
+      const scale = maxW / img.naturalWidth;
+      const w = Math.round(img.naturalWidth * scale);
+      const h = Math.round(img.naturalHeight * scale);
+      dimsRef.current = { w, h };
+      const offscreen = document.createElement("canvas");
+      offscreen.width = w; offscreen.height = h;
+      const octx = offscreen.getContext("2d");
+      octx.drawImage(img, 0, 0, w, h);
+      const imageData = octx.getImageData(0, 0, w, h);
+      originalDataRef.current = imageData;
+      lastLutKeyRef.current = null;
+      if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
+      setActivePreset("original");
+      setAdj(DEFAULT_ADJ);
+      setCurves(DEFAULT_CURVES);
+      setActiveRecipe(null);
+      setSplitView(false);
+      setImageLoaded(true);
+      setProcessing(false);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); setProcessing(false); };
+    img.src = url;
+  }, []);
+
   /* ── File loading ── */
   const loadImageFile = useCallback((file) => {
-    if (!file || !file.type.startsWith("image/")) return;
+    if (!file) return;
+    const isRaf = file.name.toLowerCase().endsWith(".raf");
+    const isImage = file.type.startsWith("image/");
+    if (!isRaf && !isImage) return;
     setProcessing(true);
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        const maxW = Math.min(1400, img.naturalWidth);
-        const scale = maxW / img.naturalWidth;
-        const w = Math.round(img.naturalWidth * scale);
-        const h = Math.round(img.naturalHeight * scale);
-        dimsRef.current = { w, h };
-        const offscreen = document.createElement("canvas");
-        offscreen.width = w; offscreen.height = h;
-        const octx = offscreen.getContext("2d");
-        octx.drawImage(img, 0, 0, w, h);
-        const imageData = octx.getImageData(0, 0, w, h);
-        originalDataRef.current = imageData;
-        lastLutKeyRef.current = null; // force LUT re-upload
-        if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
-        setActivePreset("original");
-        setAdj(DEFAULT_ADJ);
-        setCurves(DEFAULT_CURVES);
-        setActiveRecipe(null);
-        setSplitView(false);
-        setImageLoaded(true);
-        setProcessing(false);
+
+    if (isRaf) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const buffer = e.target.result;
+        // 1. Instant: show embedded JPEG preview
+        const jpegBlob = extractRafJpeg(buffer);
+        if (jpegBlob) {
+          loadImageFromBlob(jpegBlob);
+        }
+        // 2. Background: decode full RAW sensor data via LibRaw-Wasm
+        setDecodingRaw(true);
+        decodeRaf(buffer)
+          .then(({ imageData, w, h }) => {
+            // Scale down if needed (same max as regular images)
+            const maxW = Math.min(1400, w);
+            if (w > maxW) {
+              const scale = maxW / w;
+              const sw = Math.round(w * scale);
+              const sh = Math.round(h * scale);
+              const offscreen = document.createElement("canvas");
+              offscreen.width = sw; offscreen.height = sh;
+              const ctx = offscreen.getContext("2d");
+              // Draw the decoded ImageData to a temp canvas, then scale
+              const tmp = document.createElement("canvas");
+              tmp.width = w; tmp.height = h;
+              tmp.getContext("2d").putImageData(imageData, 0, 0);
+              ctx.drawImage(tmp, 0, 0, sw, sh);
+              imageData = ctx.getImageData(0, 0, sw, sh);
+              w = sw; h = sh;
+            }
+            dimsRef.current = { w, h };
+            originalDataRef.current = imageData;
+            lastLutKeyRef.current = null;
+            if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
+            setDecodingRaw(false);
+            // Trigger re-render with decoded data
+            setAdj((prev) => ({ ...prev }));
+          })
+          .catch((err) => {
+            console.error("RAW decode failed:", err);
+            setDecodingRaw(false);
+            // JPEG preview remains as fallback
+          });
       };
-      img.onerror = () => setProcessing(false);
-      img.src = e.target.result;
-    };
-    reader.onerror = () => setProcessing(false);
-    reader.readAsDataURL(file);
-  }, []);
+      reader.onerror = () => setProcessing(false);
+      reader.readAsArrayBuffer(file);
+    } else {
+      loadImageFromBlob(file);
+    }
+  }, [extractRafJpeg, loadImageFromBlob]);
 
   const loadLUTFiles = useCallback((files) => {
     setLoadingLuts(true);
@@ -512,7 +599,7 @@ export default function App() {
     e.preventDefault(); e.stopPropagation();
     const files = Array.from(e.dataTransfer?.files || []);
     const lutFiles = files.filter((f) => f.name.match(/\.(3dl|cube)$/i));
-    const imgFiles = files.filter((f) => f.type.startsWith("image/"));
+    const imgFiles = files.filter((f) => f.type.startsWith("image/") || f.name.match(/\.raf$/i));
     if (lutFiles.length > 0) loadLUTFiles(lutFiles);
     if (imgFiles.length > 0) loadImageFile(imgFiles[0]);
   };
@@ -618,7 +705,9 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [lightboxUrl]);
 
+  const HIDDEN_SIMS = ["Mono+R", "Mono+Ye", "Mono+G"];
   const lutNames = Object.keys(luts);
+  const visibleLutNames = lutNames.filter((n) => !HIDDEN_SIMS.includes(n));
 
   /* ── Styles ── */
   const presetBtn = (active) => ({
@@ -682,7 +771,7 @@ export default function App() {
           <button onClick={() => fileRef.current?.click()} style={headerBtn}>
             {processing ? "Loading..." : "Load Image"}
           </button>
-          <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
+          <input ref={fileRef} type="file" accept="image/*,.raf" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
           {imageLoaded && (
             <>
               <button onClick={() => setSplitView(!splitView)} style={{ ...headerBtn, ...(splitView ? { background: "#fff", color: "#111", borderColor: "#fff" } : {}) }}>
@@ -714,7 +803,7 @@ export default function App() {
             >
               <div style={{ fontSize: 36, marginBottom: 14, opacity: 0.15 }}>&#9723;</div>
               <p style={{ fontSize: 14, fontWeight: 500, margin: "0 0 6px", color: "#aaa" }}>Drop an image here</p>
-              <p style={{ fontSize: 12, color: "#555", margin: 0 }}>or click to browse &middot; supports JPG, PNG, WebP</p>
+              <p style={{ fontSize: 12, color: "#555", margin: 0 }}>or click to browse &middot; supports JPG, PNG, WebP, RAF</p>
             </div>
           ) : (
             <div
@@ -730,6 +819,17 @@ export default function App() {
               }}
             >
               <canvas ref={canvasCallbackRef} style={{ display: "block", width: "100%", height: "100%" }} />
+              {decodingRaw && (
+                <div style={{
+                  position: "absolute", top: 12, right: 12, padding: "6px 12px",
+                  background: "rgba(0,0,0,0.7)", borderRadius: 6,
+                  fontSize: 11, color: "#aaa", letterSpacing: "0.03em",
+                  display: "flex", alignItems: "center", gap: 8,
+                }}>
+                  <span style={{ display: "inline-block", width: 10, height: 10, border: "2px solid #555", borderTopColor: "#aaa", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                  Decoding RAW...
+                </div>
+              )}
               {splitView && (
                 <div
                   onMouseDown={(e) => { e.preventDefault(); setDraggingSplit(true); }}
@@ -762,7 +862,7 @@ export default function App() {
 
           <div style={{ flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
           {/* Recipes */}
-          <Panel title="Recipes">
+          <Panel title="Recipes" defaultOpen={false}>
             {RECIPE_CATEGORIES.map((cat) => {
               const catRecipes = RECIPES.filter((r) => r.category === cat);
               if (catRecipes.length === 0) return null;
@@ -791,16 +891,16 @@ export default function App() {
           </Panel>
 
           {/* Film Simulation */}
-          <Panel title="Film Simulation" defaultOpen={false}>
+          <Panel title="Film Simulation">
             {lutNames.length === 0 ? (
               <p style={{ fontSize: 11, color: "#555", margin: 0 }}>Loading LUTs...</p>
             ) : (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 12 }}>
-                <button onClick={() => { setActivePreset("original"); setActiveRecipe(null); }} style={presetBtn(activePreset === "original")}>
+                <button onClick={() => { setActivePreset("original"); setAdj(DEFAULT_ADJ); setCurves(DEFAULT_CURVES); setActiveRecipe(null); }} style={presetBtn(activePreset === "original")}>
                   Original
                 </button>
-                {lutNames.map((name) => (
-                  <button key={name} onClick={() => { setActivePreset(name); setActiveRecipe(null); }} style={presetBtn(activePreset === name)}>
+                {visibleLutNames.map((name) => (
+                  <button key={name} onClick={() => { setActivePreset(name); setAdj(DEFAULT_ADJ); setCurves(DEFAULT_CURVES); setActiveRecipe(null); }} style={presetBtn(activePreset === name)}>
                     {name}
                   </button>
                 ))}
