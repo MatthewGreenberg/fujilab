@@ -609,31 +609,60 @@ export default function App() {
     const clickX = Math.round((e.clientX - rect.left) / rect.width * dimsRef.current.w);
     const clickY = Math.round((e.clientY - rect.top) / rect.height * dimsRef.current.h);
 
-    // Find the smallest mask that contains the clicked point
     const masks = samMasksRef.current;
+    if (!masks.length) return;
+
+    // Precompute mask sizes (cached on first click)
+    if (!masks[0]._size) {
+      for (const m of masks) m._size = m.data.reduce((s, v) => s + v, 0);
+    }
+
+    // Find the smallest mask that contains the clicked point
     let best = null;
     let bestSize = Infinity;
     for (const m of masks) {
-      // Scale click to mask dimensions
-      const mx = Math.round(clickX / dimsRef.current.w * m.width);
-      const my = Math.round(clickY / dimsRef.current.h * m.height);
+      const mx = Math.min(m.width - 1, Math.max(0, Math.round(clickX / dimsRef.current.w * m.width)));
+      const my = Math.min(m.height - 1, Math.max(0, Math.round(clickY / dimsRef.current.h * m.height)));
       const idx = my * m.width + mx;
-      if (m.data[idx]) {
-        const size = m.data.reduce((s, v) => s + v, 0);
-        if (size < bestSize) { best = m; bestSize = size; }
+      if (m.data[idx] && m._size < bestSize) {
+        best = m;
+        bestSize = m._size;
       }
     }
-    if (!best) return; // no mask at click point
+
+    // Fallback: if no mask at exact pixel, search a radius around the click
+    if (!best) {
+      const searchRadius = 20;
+      for (const m of masks) {
+        const sx = clickX / dimsRef.current.w * m.width;
+        const sy = clickY / dimsRef.current.h * m.height;
+        for (let dy = -searchRadius; dy <= searchRadius && !best; dy += 4) {
+          for (let dx = -searchRadius; dx <= searchRadius && !best; dx += 4) {
+            const px = Math.min(m.width - 1, Math.max(0, Math.round(sx + dx)));
+            const py = Math.min(m.height - 1, Math.max(0, Math.round(sy + dy)));
+            if (m.data[py * m.width + px] && m._size < bestSize) {
+              best = m;
+              bestSize = m._size;
+            }
+          }
+        }
+      }
+    }
+
+    if (!best) return;
+
+    // Deep copy the mask to ensure React detects the change
+    const maskCopy = { data: [...best.data], width: best.width, height: best.height };
 
     setSamLayers((prev) => {
       if (prev.length === 0 || samAddingLayer) {
-        const layer = { id: Date.now(), mask: best, preset: "original", adj: { ...DEFAULT_ADJ } };
+        const layer = { id: Date.now(), mask: maskCopy, preset: "original", adj: { ...DEFAULT_ADJ } };
         const next = [...prev, layer];
         setActiveLayerIdx(next.length - 1);
         setSamAddingLayer(false);
         return next;
       }
-      return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask: best } : l);
+      return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask: maskCopy } : l);
     });
   }, [samActive, samStatus, samAddingLayer, activeLayerIdx]);
 
