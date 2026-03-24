@@ -1,10 +1,9 @@
-import { env, Sam2Model, AutoProcessor, RawImage } from "@huggingface/transformers";
+import { env, SamModel, AutoProcessor, RawImage } from "@huggingface/transformers";
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-// SAM2 Hiera Tiny — much faster inference than SAM1, designed for real-time
-const MODEL_ID = "onnx-community/sam2-hiera-tiny";
+const MODEL_ID = "Xenova/sam-vit-base";
 
 let processor = null;
 let model = null;
@@ -62,10 +61,10 @@ self.onmessage = async ({ data }) => {
     switch (data.type) {
 
       case "load": {
-        self.postMessage({ type: "progress", stage: "Downloading SAM2 model…" });
+        self.postMessage({ type: "progress", stage: "Downloading AI model…" });
         processor = await AutoProcessor.from_pretrained(MODEL_ID);
         self.postMessage({ type: "progress", stage: "Loading weights…" });
-        model = await Sam2Model.from_pretrained(MODEL_ID, { dtype: "fp32" });
+        model = await SamModel.from_pretrained(MODEL_ID, { dtype: "q8" });
         self.postMessage({ type: "modelReady" });
         break;
       }
