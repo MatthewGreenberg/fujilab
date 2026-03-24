@@ -1,5 +1,10 @@
 {
   "framework": "vite",
   "buildCommand": "npm run build",
-  "outputDirectory": "dist"
+  "outputDirectory": "dist",
+  "functions": {
+    "api/sam.js": {
+      "maxDuration": 60
+    }
+  }
 }
