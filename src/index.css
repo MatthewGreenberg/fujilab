@@ -272,6 +272,93 @@ input[type="range"]::-moz-range-track {
   flex-shrink: 0;
 }
 
+.app-sam-panel {
+  width: 260px;
+  flex-shrink: 0;
+  border-left: 1px solid #1e1e1e;
+  background: #161616;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.app-sam-panel .sam-panel-scroll {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+.mask-toolbar {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(0,0,0,0.78);
+  backdrop-filter: blur(12px);
+  border-radius: 10px;
+  padding: 4px;
+  pointer-events: auto;
+  z-index: 20;
+}
+
+.mask-toolbar-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: #999;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s, color 0.12s;
+}
+
+.mask-toolbar-btn:hover {
+  background: rgba(255,255,255,0.1);
+  color: #ddd;
+}
+
+.mask-toolbar-btn.active {
+  background: rgba(255,255,255,0.15);
+  color: #fff;
+}
+
+.mask-toolbar-divider {
+  width: 1px;
+  height: 20px;
+  background: rgba(255,255,255,0.12);
+  margin: 0 2px;
+}
+
+.mask-toolbar-size {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 4px;
+}
+
+.mask-toolbar-size input[type="range"] {
+  width: 70px;
+  height: 2px;
+  accent-color: #888;
+}
+
+.mask-toolbar-size span {
+  font-size: 10px;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+  min-width: 28px;
+  text-align: right;
+}
+
 .header-actions {
   display: flex;
   gap: 6px;
@@ -283,6 +370,10 @@ input[type="range"]::-moz-range-track {
 @media (max-width: 1024px) {
   .app-sidebar {
     width: 240px;
+  }
+
+  .app-sam-panel {
+    width: 220px;
   }
 }
 
@@ -310,6 +401,10 @@ input[type="range"]::-moz-range-track {
 
   .app-content {
     flex-direction: column;
+  }
+
+  .app-sam-panel {
+    display: none;
   }
 
   .app-canvas-area {

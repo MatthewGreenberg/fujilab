@@ -1,5 +1,46 @@
 const FAL_KEY = (process.env.FAL_KEY || "").trim();
 const FAL_QUEUE = "https://queue.fal.run/fal-ai/sam-3/image";
+const FAL_REST = "https://rest.alpha.fal.ai";
+
+async function uploadDataUri(dataUri, falKey) {
+  // Parse data URI → Buffer
+  const [meta, b64] = dataUri.split(",");
+  const contentType = meta.match(/:(.*?);/)?.[1] || "image/jpeg";
+  const buffer = Buffer.from(b64, "base64");
+
+  // Step 1: Get auth token for fal CDN
+  const tokenResp = await fetch(
+    `${FAL_REST}/storage/auth/token?storage_type=fal-cdn-v3`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Key ${falKey}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    }
+  );
+  if (!tokenResp.ok) {
+    const detail = await tokenResp.text();
+    throw new Error(`Storage auth failed: ${tokenResp.status} ${detail}`);
+  }
+  const { token, token_type, base_url } = await tokenResp.json();
+
+  // Step 2: Upload file bytes to fal CDN
+  const uploadResp = await fetch(`${base_url}/files/upload`, {
+    method: "POST",
+    headers: {
+      Authorization: `${token_type} ${token}`,
+      "Content-Type": contentType,
+      "X-Fal-File-Name": `upload-${Date.now()}.${contentType.split("/")[1] || "jpg"}`,
+    },
+    body: buffer,
+  });
+  if (!uploadResp.ok) throw new Error(`Upload failed: ${uploadResp.status}`);
+  const { access_url } = await uploadResp.json();
+
+  return access_url;
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -16,10 +57,15 @@ export default async function handler(req, res) {
   try {
     // POST — submit a new SAM3 request to the queue
     if (req.method === "POST") {
-      const { image_url, point_prompts, prompt } = req.body;
+      let { image_url, point_prompts, prompt } = req.body;
       if (!image_url) return res.status(400).json({ error: "image_url is required" });
 
-      const input = { image_url, apply_mask: false, output_format: "png" };
+      // Upload data URIs to fal storage first
+      if (image_url.startsWith("data:")) {
+        image_url = await uploadDataUri(image_url, FAL_KEY);
+      }
+
+      const input = { image_url, apply_mask: false, output_format: "png", return_multiple_masks: true };
       if (point_prompts?.length) input.point_prompts = point_prompts;
       else if (prompt) input.prompt = prompt;
 
