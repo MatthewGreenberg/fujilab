@@ -411,7 +411,7 @@ export default function App() {
     });
   }, []);
 
-  /* ── SAM: call fal.ai SAM3 API via serverless proxy ── */
+  /* ── SAM: call fal.ai SAM3 API via serverless proxy (queue + poll) ── */
   const callSamAPI = useCallback(async ({ point_prompts, prompt }) => {
     const image_url = getImageDataUri();
     if (!image_url) throw new Error("No image loaded");
@@ -420,22 +420,35 @@ export default function App() {
     if (point_prompts) body.point_prompts = point_prompts;
     else if (prompt) body.prompt = prompt;
 
-    const resp = await fetch("/api/sam", {
+    // Submit to queue
+    const submitResp = await fetch("/api/sam", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || `API error ${resp.status}`);
+    if (!submitResp.ok) {
+      const err = await submitResp.json().catch(() => ({}));
+      throw new Error(err.error || `API error ${submitResp.status}`);
     }
+    const queue = await submitResp.json();
 
-    const result = await resp.json();
-    const maskUrl = result.masks?.[0]?.url || result.image?.url;
-    if (!maskUrl) throw new Error("No mask in API response");
+    // Poll until complete (max ~90s)
+    const { statusUrl, resultUrl } = queue;
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const pollResp = await fetch(`/api/sam?statusUrl=${encodeURIComponent(statusUrl)}&resultUrl=${encodeURIComponent(resultUrl)}`);
+      const data = await pollResp.json();
 
-    return decodeMaskFromUrl(maskUrl);
+      if (data.status === "COMPLETED") {
+        const maskUrl = data.masks?.[0]?.url || data.image?.url;
+        if (!maskUrl) throw new Error("No mask in API response");
+        return decodeMaskFromUrl(maskUrl);
+      }
+      if (data.status === "FAILED") {
+        throw new Error("SAM3 prediction failed");
+      }
+    }
+    throw new Error("SAM3 request timed out");
   }, [getImageDataUri, decodeMaskFromUrl]);
 
   /* ── SAM: activate — auto-select subject via text prompt ── */
