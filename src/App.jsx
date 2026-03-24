@@ -403,7 +403,7 @@ export default function App() {
       vignette: vignette / 100,
       grain: grain / 100,
       grainAmp: 35 + (grainSize / 100) * 35,
-      grainCellSize: 0.75 + (grainSize / 100) * 1.5,
+      grainCellSize: 0.4 + (grainSize / 100) * 0.6,
       splitView,
       splitPos,
     });
@@ -432,10 +432,6 @@ export default function App() {
       originalDataRef.current = imageData;
       lastLutKeyRef.current = null;
       if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
-      setActivePreset("original");
-      setAdj({ ...DEFAULT_ADJ });
-      setCurves({ ...DEFAULT_CURVES });
-      setActiveRecipe(null);
       setSplitView(false);
       setImageLoaded(true);
       setProcessing(false);
@@ -522,7 +518,7 @@ export default function App() {
           colorChrome: adj.colorChrome / 100, colorChromeFxBlue: adj.colorChromeFxBlue / 100,
           vignette: adj.vignette / 100,
           grain: adj.grain / 100, grainAmp: 35 + (adj.grainSize / 100) * 35,
-          grainCellSize: 0.75 + (adj.grainSize / 100) * 1.5,
+          grainCellSize: 0.4 + (adj.grainSize / 100) * 0.6,
           splitView: false, splitPos: 50,
         });
         exportCanvas = offCanvas;
