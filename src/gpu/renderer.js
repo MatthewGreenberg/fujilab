@@ -255,19 +255,21 @@ uniform float u_splitPos;
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
-// Deterministic grain noise with bilinear interpolation for clumping
+// Grain hash — avoids sin() which loses precision at large pixel coordinates
 float grainHash(vec2 p) {
-  float h = p.x * 374761.393 + p.y * 668265.263;
-  return fract(sin(h) * 43758.5453);
+  p = fract(p * vec2(0.1031, 0.1030));
+  p += dot(p, p.yx + 33.33);
+  return fract((p.x + p.y) * p.x);
 }
 float grainNoise(vec2 p) {
   vec2 ip = floor(p);
   vec2 fp = fract(p);
+  vec2 uf = fp * fp * (3.0 - 2.0 * fp); // smoothstep for softer clumping
   float n00 = grainHash(ip);
   float n10 = grainHash(ip + vec2(1.0, 0.0));
   float n01 = grainHash(ip + vec2(0.0, 1.0));
   float n11 = grainHash(ip + vec2(1.0, 1.0));
-  return mix(mix(n00, n10, fp.x), mix(n01, n11, fp.x), fp.y);
+  return mix(mix(n00, n10, uf.x), mix(n01, n11, uf.x), uf.y);
 }
 
 float rgbHue(vec3 c) {
@@ -376,11 +378,13 @@ void main() {
     color *= 1.0 - u_vignette * dist2 * 2.0;
   }
 
-  // 8. Grain
+  // 8. Grain — monochromatic, stronger in shadows like real film
   if (u_grain > 0.0) {
+    vec2 p = gl_FragCoord.xy / u_grainCellSize;
     float l = luma(color);
-    float w = exp(-((l - 0.4) * (l - 0.4)) / 0.1225);
-    float n = (grainNoise(gl_FragCoord.xy / u_grainCellSize) - 0.5) * 2.0;
+    float w = 1.0 - l * 0.6;
+    float n = (grainNoise(p) + grainNoise(p * 0.5 + vec2(4.1, 9.7)) * 0.3) / 1.3;
+    n = (n - 0.5) * 2.0;
     color += n * (u_grainAmp / 255.0) * u_grain * w;
   }
 

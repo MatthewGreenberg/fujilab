@@ -402,8 +402,8 @@ export default function App() {
       colorChromeFxBlue: colorChromeFxBlue / 100,
       vignette: vignette / 100,
       grain: grain / 100,
-      grainAmp: 55 + (grainSize / 100) * 35,
-      grainCellSize: 1.0 + (grainSize / 100) * 2.5,
+      grainAmp: 35 + (grainSize / 100) * 35,
+      grainCellSize: 0.75 + (grainSize / 100) * 1.5,
       splitView,
       splitPos,
     });
@@ -521,8 +521,8 @@ export default function App() {
           saturation: adj.saturation, vibrance: adj.vibrance,
           colorChrome: adj.colorChrome / 100, colorChromeFxBlue: adj.colorChromeFxBlue / 100,
           vignette: adj.vignette / 100,
-          grain: adj.grain / 100, grainAmp: 55 + (adj.grainSize / 100) * 35,
-          grainCellSize: 1.0 + (adj.grainSize / 100) * 2.5,
+          grain: adj.grain / 100, grainAmp: 35 + (adj.grainSize / 100) * 35,
+          grainCellSize: 0.75 + (adj.grainSize / 100) * 1.5,
           splitView: false, splitPos: 50,
         });
         exportCanvas = offCanvas;
