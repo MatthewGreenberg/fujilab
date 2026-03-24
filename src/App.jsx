@@ -164,6 +164,14 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
 
+  // ── SAM subject selection ──
+  const [samActive, setSamActive] = useState(false);
+  // 'idle' | 'loading' | 'encoding' | 'ready' | 'segmenting'
+  const [samStatus, setSamStatus] = useState("idle");
+  const [samMask, setSamMask] = useState(null); // { data, width, height }
+  const [subjectPreset, setSubjectPreset] = useState("original");
+  const [subjectAdj, setSubjectAdj] = useState({ ...DEFAULT_ADJ });
+
   const canvasRef = useRef(null);
   const gpuRef = useRef(null);
   const originalDataRef = useRef(null);
@@ -177,6 +185,8 @@ export default function App() {
   const headerRef = useRef(null);
   const sheetDragRef = useRef({ startY: 0, startH: 0 });
   const splitRef = useRef(null);
+  const samWorkerRef = useRef(null);
+  const overlayCanvasRef = useRef(null);
 
   const setField = useCallback((field, value) => {
     setAdj((prev) => ({ ...prev, [field]: value }));
@@ -366,6 +376,152 @@ export default function App() {
 
     return { r: buildTable(rCurve), g: buildTable(gCurve), b: buildTable(bCurve) };
   }, [adj, curves]);
+
+  /* ── SAM: activate / deactivate ── */
+  const activateSAM = useCallback(() => {
+    setSamActive(true);
+    if (samWorkerRef.current) {
+      // Already created — just re-encode if image is ready
+      if (originalDataRef.current) {
+        setSamStatus("encoding");
+        const buf = originalDataRef.current.data.buffer.slice(0);
+        samWorkerRef.current.postMessage(
+          { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
+          [buf],
+        );
+      }
+      return;
+    }
+    setSamStatus("loading");
+    const worker = new Worker(new URL("./sam/worker.js", import.meta.url), { type: "module" });
+    samWorkerRef.current = worker;
+    worker.onmessage = ({ data }) => {
+      switch (data.type) {
+        case "progress":
+          // status messages are already in samStatus via the loading/encoding states
+          break;
+        case "modelReady":
+          if (originalDataRef.current) {
+            setSamStatus("encoding");
+            const buf = originalDataRef.current.data.buffer.slice(0);
+            worker.postMessage(
+              { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
+              [buf],
+            );
+          } else {
+            setSamStatus("ready");
+          }
+          break;
+        case "imageReady":
+          setSamStatus("ready");
+          break;
+        case "maskReady":
+          setSamMask({ data: data.maskData, width: data.maskWidth, height: data.maskHeight });
+          setSamStatus("ready");
+          break;
+        case "error":
+          console.error("SAM worker error:", data.message);
+          setSamStatus("idle");
+          break;
+      }
+    };
+    worker.postMessage({ type: "load" });
+  }, []);
+
+  const deactivateSAM = useCallback(() => {
+    setSamActive(false);
+    setSamMask(null);
+    setSamStatus("idle");
+    // Clear overlay
+    if (overlayCanvasRef.current) {
+      const ctx = overlayCanvasRef.current.getContext("2d");
+      ctx.clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height);
+    }
+  }, []);
+
+  /* ── SAM: render subject layer onto overlay canvas ── */
+  const renderSubjectOverlay = useCallback(() => {
+    if (!samMask || !originalDataRef.current || !overlayCanvasRef.current) return;
+    const { w, h } = dimsRef.current;
+
+    // Render subject version offscreen
+    const offCanvas = document.createElement("canvas");
+    offCanvas.width = w;
+    offCanvas.height = h;
+    let gpu;
+    try {
+      gpu = createRenderer(offCanvas);
+    } catch {
+      return; // WebGL 2 not available for offscreen canvas
+    }
+    gpu.uploadImage(originalDataRef.current, w, h);
+
+    const lut = luts[subjectPreset];
+    if (lut) gpu.uploadLUT(lut.data, lut.size);
+
+    // Identity curve tables (no tone curve applied to subject layer)
+    const identity = Array.from({ length: 256 }, (_, i) => i);
+    gpu.uploadCurveLUTs(identity, identity, identity);
+
+    const { intensity, highlights, shadows, temperature, tint, vibrance,
+            saturation, colorChrome, colorChromeFxBlue, grain, grainSize } = subjectAdj;
+
+    gpu.render({
+      lutSize: lut ? lut.size : 0,
+      hasLut: !!lut,
+      intensity: intensity / 100,
+      highlights,
+      shadows,
+      temperature,
+      tint,
+      saturation,
+      vibrance,
+      colorChrome: colorChrome / 100,
+      colorChromeFxBlue: colorChromeFxBlue / 100,
+      vignette: 0,
+      grain: grain / 100,
+      grainAmp: 35 + (grainSize / 100) * 35,
+      grainCellSize: 0.4 + (grainSize / 100) * 0.6,
+      splitView: false,
+      splitPos: 50,
+    });
+
+    // Read rendered pixels
+    const subjectImageData = gpu.readPixels();
+    gpu.destroy();
+
+    // Apply mask — transparent where mask = 0
+    const { data: maskData } = samMask;
+    const out = new Uint8ClampedArray(subjectImageData.data);
+    for (let i = 0; i < w * h; i++) {
+      if (!maskData[i]) out[i * 4 + 3] = 0;
+    }
+
+    const overlayCanvas = overlayCanvasRef.current;
+    overlayCanvas.width = w;
+    overlayCanvas.height = h;
+    const ctx = overlayCanvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    ctx.putImageData(new ImageData(out, w, h), 0, 0);
+  }, [samMask, subjectAdj, subjectPreset, luts]);
+
+  // Re-render subject overlay whenever mask or subject settings change
+  useEffect(() => {
+    if (samMask) renderSubjectOverlay();
+  }, [samMask, renderSubjectOverlay]);
+
+  /* ── SAM: handle click on canvas to trigger segmentation ── */
+  const handleSamClick = useCallback((e) => {
+    if (!samActive || samStatus !== "ready" || !samWorkerRef.current) return;
+    e.stopPropagation(); // don't open lightbox
+    const rect = e.currentTarget.getBoundingClientRect();
+    const scaleX = dimsRef.current.w / rect.width;
+    const scaleY = dimsRef.current.h / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    setSamStatus("segmenting");
+    samWorkerRef.current.postMessage({ type: "segment", x, y });
+  }, [samActive, samStatus]);
 
   /* ── GPU render pass ── */
   const processImage = useCallback(() => {
@@ -740,6 +896,13 @@ export default function App() {
               <button onClick={() => setSplitView(!splitView)} className={`header-btn${splitView ? " active" : ""}`}>
                 Before/After
               </button>
+              <button
+                onClick={samActive ? deactivateSAM : activateSAM}
+                className={`header-btn${samActive ? " active" : ""}`}
+                title="Click on any subject to apply a separate film simulation"
+              >
+                {samStatus === "loading" || samStatus === "encoding" ? "Loading AI…" : "Select Subject"}
+              </button>
               <button onClick={shareRecipeLink} className={`header-btn${shareCopied ? " success" : ""}`}>
                 {shareCopied ? "Copied" : "Share"}
               </button>
@@ -808,17 +971,38 @@ export default function App() {
           ) : (
             <div
               ref={splitRef}
-              onClick={!splitView ? openLightbox : undefined}
+              onClick={samActive && samStatus === "ready" ? handleSamClick : (!splitView ? openLightbox : undefined)}
               style={{
                 position: "relative",
                 aspectRatio: `${dimsRef.current.w} / ${dimsRef.current.h}`,
                 maxWidth: "100%",
                 maxHeight: "100%",
-                cursor: splitView ? "default" : "zoom-in",
+                cursor: samActive && samStatus === "ready" ? "crosshair" : splitView ? "default" : "zoom-in",
                 flexShrink: 0,
               }}
             >
               <canvas ref={canvasCallbackRef} style={{ display: "block", width: "100%", height: "100%" }} />
+              {/* SAM subject overlay */}
+              <canvas
+                ref={overlayCanvasRef}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
+              />
+              {/* SAM status instructions */}
+              {samActive && (samStatus === "loading" || samStatus === "encoding" || samStatus === "ready" || samStatus === "segmenting") && (
+                <div style={{
+                  position: "absolute", bottom: 14, left: "50%", transform: "translateX(-50%)",
+                  background: "rgba(0,0,0,0.72)", backdropFilter: "blur(8px)",
+                  color: "#fff", fontSize: 12, fontWeight: 500,
+                  padding: "7px 14px", borderRadius: 20, pointerEvents: "none",
+                  whiteSpace: "nowrap", letterSpacing: "0.01em",
+                }}>
+                  {samStatus === "loading" && "Downloading AI model (one time)…"}
+                  {samStatus === "encoding" && "Analyzing image…"}
+                  {samStatus === "ready" && !samMask && "Click on your subject"}
+                  {samStatus === "ready" && samMask && "Click again to reselect"}
+                  {samStatus === "segmenting" && "Selecting…"}
+                </div>
+              )}
               {splitView && (
                 <div
                   onMouseDown={(e) => { e.preventDefault(); setDraggingSplit(true); }}
@@ -883,8 +1067,39 @@ export default function App() {
             })}
           </Panel>
 
+          {/* ── Subject Layer (SAM) ── */}
+          {samActive && samMask && (
+            <Panel title="Subject Layer" defaultOpen={true}>
+              <div style={{ fontSize: 11, color: "#666", marginBottom: 8, lineHeight: 1.4 }}>
+                Independent film sim applied only to the selected subject.
+              </div>
+              {/* Subject film simulation */}
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 10, color: "#555", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 5 }}>Film Simulation</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  <button onClick={() => setSubjectPreset("original")} style={presetBtn(subjectPreset === "original")}>None</button>
+                  {visibleLutNames.map((name) => (
+                    <button key={name} onClick={() => setSubjectPreset(name)} style={presetBtn(subjectPreset === name)}>{name}</button>
+                  ))}
+                </div>
+              </div>
+              <Slider label="Intensity" value={subjectAdj.intensity} min={0} max={100} defaultValue={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, intensity: v }))} format={pctFmt} />
+              <Slider label="Highlights" value={subjectAdj.highlights} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, highlights: v }))} format={signFmt} />
+              <Slider label="Shadows" value={subjectAdj.shadows} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, shadows: v }))} format={signFmt} />
+              <Slider label="Temperature" value={subjectAdj.temperature} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, temperature: v }))} format={signFmt} />
+              <Slider label="Saturation" value={subjectAdj.saturation} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, saturation: v }))} format={signFmt} />
+              <button
+                onClick={() => { setSamMask(null); if (overlayCanvasRef.current) { overlayCanvasRef.current.getContext("2d").clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height); } }}
+                className="action-btn"
+                style={{ marginTop: 4 }}
+              >
+                Clear Selection
+              </button>
+            </Panel>
+          )}
+
           {/* Film Simulation */}
-          <Panel title="Film Simulation">
+          <Panel title={samMask && samActive ? "Background Film Simulation" : "Film Simulation"}>
             {lutNames.length === 0 ? (
               <p style={{ fontSize: 11, color: "#555", margin: 0 }}>Loading LUTs...</p>
             ) : (
