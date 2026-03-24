@@ -2,53 +2,9 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { parse3DL, parseCube } from "./lut";
 import CurveEditor, { buildCurveLUT } from "./CurveEditor";
 import { createRenderer, isWebGL2Supported } from "./gpu/renderer";
-import { LibRaw } from "libraw-mini";
 import { parseRecipe } from "./recipeParser";
 import { RECIPES, RECIPE_CATEGORIES } from "./recipes";
 
-/* Decode a RAF file's raw sensor data via libraw-mini (Emscripten WASM port). */
-async function decodeRaf(arrayBuffer) {
-  const raw = await new LibRaw();
-
-  const openResult = await raw.open(new Uint8Array(arrayBuffer), null);
-
-  // Set params after open, before processing. use_camera_wb for proper color.
-  await raw.setparams({ use_camera_wb: 1 });
-
-  // A progress callback MUST be provided — without one, the first progress
-  // message resolves the promise prematurely instead of the actual image data.
-  const result = await raw.getimage(() => {});
-  await raw.close();
-
-  if (!result || !result.data || result.data.length === 0) {
-    throw new Error(`RAW decode returned empty data (getimage returned: ${JSON.stringify(result, (k, v) => v instanceof Uint8Array ? `Uint8Array(${v.length})` : v)})`);
-  }
-
-  const w = result.width;
-  const h = result.height;
-  const rgb = result.data;
-
-  // LibRaw WASM outputs linear data — apply sRGB gamma so it looks correct.
-  // Pre-compute a 256-entry lookup table for the conversion.
-  const gammaLUT = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) {
-    const v = i / 255;
-    gammaLUT[i] = Math.round((v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055) * 255);
-  }
-
-  const rgba = new Uint8Array(w * h * 4);
-  const bytesPerPixel = rgb.length / (w * h);
-  if (bytesPerPixel === 4) {
-    for (let i = 0, j = 0; i < rgb.length; i += 4, j += 4) {
-      rgba[j] = gammaLUT[rgb[i]]; rgba[j + 1] = gammaLUT[rgb[i + 1]]; rgba[j + 2] = gammaLUT[rgb[i + 2]]; rgba[j + 3] = 255;
-    }
-  } else {
-    for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
-      rgba[j] = gammaLUT[rgb[i]]; rgba[j + 1] = gammaLUT[rgb[i + 1]]; rgba[j + 2] = gammaLUT[rgb[i + 2]]; rgba[j + 3] = 255;
-    }
-  }
-  return { imageData: new ImageData(new Uint8ClampedArray(rgba.buffer), w, h), w, h };
-}
 
 const BUNDLED_LUTS = [
   "Fuji XTrans III - Acros.3dl",
@@ -196,7 +152,6 @@ export default function App() {
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [loadingLuts, setLoadingLuts] = useState(true);
-  const [decodingRaw, setDecodingRaw] = useState(false); // false | "decoding" | {error: string}
   const [sheetDragging, setSheetDragging] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState(null);
   const [pasteModalOpen, setPasteModalOpen] = useState(false);
@@ -458,18 +413,6 @@ export default function App() {
     if (imageLoaded) processImage();
   }, [imageLoaded, processImage]);
 
-  /* ── Extract embedded JPEG from a Fujifilm .RAF file ── */
-  const extractRafJpeg = useCallback((arrayBuffer) => {
-    const view = new DataView(arrayBuffer);
-    const magic = String.fromCharCode(...new Uint8Array(arrayBuffer, 0, 16));
-    if (!magic.startsWith("FUJIFILMCCD-RAW")) return null;
-    // Bytes 84-87: JPEG offset (big-endian), 88-91: JPEG length
-    const jpegOffset = view.getUint32(84, false);
-    const jpegLength = view.getUint32(88, false);
-    if (jpegOffset === 0 || jpegLength === 0 || jpegOffset + jpegLength > arrayBuffer.byteLength) return null;
-    return new Blob([arrayBuffer.slice(jpegOffset, jpegOffset + jpegLength)], { type: "image/jpeg" });
-  }, []);
-
   /* ── Load an image onto the canvas and GPU ── */
   const loadImageFromBlob = useCallback((blob) => {
     const url = URL.createObjectURL(blob);
@@ -490,8 +433,8 @@ export default function App() {
       lastLutKeyRef.current = null;
       if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
       setActivePreset("original");
-      setAdj(DEFAULT_ADJ);
-      setCurves(DEFAULT_CURVES);
+      setAdj({ ...DEFAULT_ADJ });
+      setCurves({ ...DEFAULT_CURVES });
       setActiveRecipe(null);
       setSplitView(false);
       setImageLoaded(true);
@@ -511,63 +454,11 @@ export default function App() {
 
   /* ── File loading ── */
   const loadImageFile = useCallback((file) => {
-    if (!file) return;
-    const isRaf = file.name.toLowerCase().endsWith(".raf");
-    const isImage = file.type.startsWith("image/");
-    if (!isRaf && !isImage) return;
+    if (!file || !file.type.startsWith("image/")) return;
     setProcessing(true);
-
-    sourceBlobRef.current = file;  // keep for full-res export
-
-    if (isRaf) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const buffer = e.target.result;
-        // 1. Instant: show embedded JPEG preview
-        const jpegBlob = extractRafJpeg(buffer);
-        if (jpegBlob) {
-          loadImageFromBlob(jpegBlob);
-        }
-        // 2. Background: decode full RAW sensor data via LibRaw-Wasm
-        setDecodingRaw("decoding");
-        decodeRaf(buffer)
-          .then(({ imageData, w, h }) => {
-            // Scale down if needed (same max as regular images)
-            const maxW = Math.min(1400, w);
-            if (w > maxW) {
-              const scale = maxW / w;
-              const sw = Math.round(w * scale);
-              const sh = Math.round(h * scale);
-              const offscreen = document.createElement("canvas");
-              offscreen.width = sw; offscreen.height = sh;
-              const ctx = offscreen.getContext("2d");
-              const tmp = document.createElement("canvas");
-              tmp.width = w; tmp.height = h;
-              tmp.getContext("2d").putImageData(imageData, 0, 0);
-              ctx.drawImage(tmp, 0, 0, sw, sh);
-              imageData = ctx.getImageData(0, 0, sw, sh);
-              w = sw; h = sh;
-            }
-            dimsRef.current = { w, h };
-            originalDataRef.current = imageData;
-            lastLutKeyRef.current = null;
-            if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
-            setDecodingRaw(false);
-            setAdj((prev) => ({ ...prev }));
-          })
-          .catch((err) => {
-            const msg = err?.message || String(err);
-            console.warn("RAW decode failed:", msg);
-            setDecodingRaw({ error: msg });
-            setTimeout(() => setDecodingRaw((v) => v && v.error ? false : v), 6000);
-          });
-      };
-      reader.onerror = () => setProcessing(false);
-      reader.readAsArrayBuffer(file);
-    } else {
-      loadImageFromBlob(file);
-    }
-  }, [extractRafJpeg, loadImageFromBlob]);
+    sourceBlobRef.current = file;
+    loadImageFromBlob(file);
+  }, [loadImageFromBlob]);
 
   const loadLUTFiles = useCallback((files) => {
     setLoadingLuts(true);
@@ -598,27 +489,20 @@ export default function App() {
       // Full-res export: re-decode source at native resolution, render in offscreen GPU
       if (exportFullRes && sourceBlobRef.current) {
         const blob = sourceBlobRef.current;
-        const isRaf = blob.name?.toLowerCase().endsWith(".raf");
         let fullImageData, fw, fh;
 
-        if (isRaf) {
-          const buffer = await blob.arrayBuffer();
-          const result = await decodeRaf(buffer);
-          fullImageData = result.imageData; fw = result.w; fh = result.h;
-        } else {
-          const url = URL.createObjectURL(blob);
-          const img = await new Promise((resolve, reject) => {
-            const i = new Image();
-            i.onload = () => { URL.revokeObjectURL(url); resolve(i); };
-            i.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Failed to load")); };
-            i.src = url;
-          });
-          fw = img.naturalWidth; fh = img.naturalHeight;
-          const oc = document.createElement("canvas");
-          oc.width = fw; oc.height = fh;
-          oc.getContext("2d").drawImage(img, 0, 0);
-          fullImageData = oc.getContext("2d").getImageData(0, 0, fw, fh);
-        }
+        const url = URL.createObjectURL(blob);
+        const img = await new Promise((resolve, reject) => {
+          const i = new Image();
+          i.onload = () => { URL.revokeObjectURL(url); resolve(i); };
+          i.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Failed to load")); };
+          i.src = url;
+        });
+        fw = img.naturalWidth; fh = img.naturalHeight;
+        const oc = document.createElement("canvas");
+        oc.width = fw; oc.height = fh;
+        oc.getContext("2d").drawImage(img, 0, 0);
+        fullImageData = oc.getContext("2d").getImageData(0, 0, fw, fh);
 
         // Render at full res in an offscreen canvas
         const offCanvas = document.createElement("canvas");
@@ -684,7 +568,7 @@ export default function App() {
     e.preventDefault(); e.stopPropagation();
     const files = Array.from(e.dataTransfer?.files || []);
     const lutFiles = files.filter((f) => f.name.match(/\.(3dl|cube)$/i));
-    const imgFiles = files.filter((f) => f.type.startsWith("image/") || f.name.match(/\.raf$/i));
+    const imgFiles = files.filter((f) => f.type.startsWith("image/"));
     if (lutFiles.length > 0) loadLUTFiles(lutFiles);
     if (imgFiles.length > 0) loadImageFile(imgFiles[0]);
   };
@@ -854,7 +738,7 @@ export default function App() {
           <button onClick={() => fileRef.current?.click()} className="header-btn">
             {processing ? "Loading..." : "Load Image"}
           </button>
-          <input ref={fileRef} type="file" accept="image/*,.raf" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
+          <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
           {imageLoaded && (
             <>
               <button onClick={() => setSplitView(!splitView)} className={`header-btn${splitView ? " active" : ""}`}>
@@ -922,7 +806,7 @@ export default function App() {
                 onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a2a"; e.currentTarget.style.background = "transparent"; }}
               >
                 <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 4px", color: "#888" }}>Upload your photo</p>
-                <p style={{ fontSize: 11, color: "#333", margin: 0 }}>JPG, PNG, WebP, or Fuji RAF</p>
+                <p style={{ fontSize: 11, color: "#333", margin: 0 }}>JPG, PNG, WebP, HEIC</p>
               </div>
             </div>
           ) : (
@@ -939,19 +823,6 @@ export default function App() {
               }}
             >
               <canvas ref={canvasCallbackRef} style={{ display: "block", width: "100%", height: "100%" }} />
-              {decodingRaw && (
-                <div style={{
-                  position: "absolute", top: 12, right: 12, padding: "6px 12px",
-                  background: "rgba(0,0,0,0.7)", borderRadius: 6, maxWidth: 360,
-                  fontSize: 11, color: decodingRaw?.error ? "#c88" : "#aaa", letterSpacing: "0.03em",
-                  display: "flex", alignItems: "center", gap: 8,
-                }}>
-                  {decodingRaw === "decoding" && (
-                    <span style={{ display: "inline-block", width: 10, height: 10, border: "2px solid #555", borderTopColor: "#aaa", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
-                  )}
-                  {decodingRaw === "decoding" ? "Decoding RAW..." : `RAW decode failed: ${decodingRaw?.error} — using camera JPEG`}
-                </div>
-              )}
               {splitView && (
                 <div
                   onMouseDown={(e) => { e.preventDefault(); setDraggingSplit(true); }}
