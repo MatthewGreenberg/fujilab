@@ -310,23 +310,21 @@ void main() {
     float hue = rgbHue(color);
     float l = luma(color);
 
-    if (u_colorChrome > 0.0 && sat > 0.4 && hue >= 0.0) {
-      float hueMask = 1.0;
-      if (hue > 140.0 && hue < 200.0) hueMask = max(0.0, 1.0 - (hue - 140.0) / 60.0);
-      else if (hue >= 200.0) hueMask = 0.0;
-      if (hueMask > 0.0) {
-        float str = ((sat - 0.4) / 0.6) * u_colorChrome * hueMask;
-        float f = l < 0.5 ? 1.0 - str * 0.3 * (1.0 - l * 2.0) : 1.0 - str * 0.04;
-        color *= f;
-      }
+    // Color Chrome: enrich warm tones (reds/oranges/yellows/greens).
+    // Pushes each pixel away from its luma grey point, increasing colour density.
+    // Low sat threshold (0.15) ensures it works on post-LUT desaturated images.
+    if (u_colorChrome > 0.0 && sat > 0.15 && hue >= 0.0 && hue < 200.0) {
+      float hueMask = hue < 140.0 ? 1.0 : max(0.0, 1.0 - (hue - 140.0) / 60.0);
+      float str = sat * u_colorChrome * hueMask;
+      color = (color + (color - vec3(l)) * str * 0.8) * (1.0 - str * 0.07);
     }
-    if (u_colorChromeFxBlue > 0.0 && sat > 0.3 && hue >= 0.0) {
+    // Color Chrome FX Blue: enrich blue/cyan/purple tones with the same approach.
+    if (u_colorChromeFxBlue > 0.0 && sat > 0.15 && hue >= 0.0) {
       float dist = min(abs(hue - 235.0), 360.0 - abs(hue - 235.0));
       if (dist < 55.0) {
         float mask = cos((dist / 55.0) * 1.5707963);
         float str = mask * sat * u_colorChromeFxBlue;
-        float f = l < 0.5 ? 1.0 - str * 0.35 * (1.0 - l * 2.0) : 1.0 - str * 0.05;
-        color *= f;
+        color = (color + (color - vec3(l)) * str * 0.8) * (1.0 - str * 0.12);
       }
     }
   }

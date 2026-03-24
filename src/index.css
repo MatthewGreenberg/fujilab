@@ -9,6 +9,12 @@ body {
   background: #111;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* Dynamic viewport height — respects collapsing browser chrome on iOS */
+.app-root {
+  height: 100dvh !important;
 }
 
 /* Dark scrollbar for sidebar */
@@ -61,4 +67,91 @@ input[type="range"]::-moz-range-track {
   height: 3px;
   background: #2a2a2a;
   border-radius: 2px;
+}
+
+/* ── Responsive layout ── */
+.app-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.app-canvas-area {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.app-sidebar {
+  width: 300px;
+  flex-shrink: 0;
+}
+
+.header-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* ── Tablet (641px – 1024px) ── */
+@media (max-width: 1024px) {
+  .app-sidebar {
+    width: 240px;
+  }
+}
+
+/* ── Bottom sheet drag handle (mobile only) ── */
+.sheet-handle {
+  display: none;
+}
+
+/* ── Mobile (≤ 640px) ── */
+@media (max-width: 640px) {
+  .sheet-handle {
+    display: flex !important;
+  }
+
+  .app-header {
+    padding: 10px 12px !important;
+    gap: 8px !important;
+    flex-wrap: wrap;
+  }
+
+  .header-actions {
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .app-content {
+    flex-direction: column;
+  }
+
+  .app-canvas-area {
+    flex: none !important;
+    /* height controlled by JS bottom-sheet logic */
+  }
+
+  .app-sidebar {
+    width: 100% !important;
+    border-left: none !important;
+    border-top: 1px solid #1e1e1e;
+    /* flex and overflow controlled by JS bottom-sheet logic */
+  }
+
+  /* Larger touch targets for sliders */
+  input[type="range"] {
+    height: 4px;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    width: 20px;
+    height: 20px;
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+  }
 }

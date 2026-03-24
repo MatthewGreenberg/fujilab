@@ -5,9 +5,6 @@ import { createRenderer, isWebGL2Supported } from "./gpu/renderer";
 
 const BUNDLED_LUTS = [
   "Fuji XTrans III - Acros.3dl",
-  "Fuji XTrans III - Acros+G.3dl",
-  "Fuji XTrans III - Acros+R.3dl",
-  "Fuji XTrans III - Acros+Ye.3dl",
   "Fuji XTrans III - Astia.3dl",
   "Fuji XTrans III - Classic Chrome.3dl",
   "Fuji XTrans III - Mono.3dl",
@@ -172,7 +169,7 @@ const RECIPES = [
     name: "Film Noir",
     category: "B&W",
     description: "Deep shadows, high drama",
-    filmSim: "Acros+R",
+    filmSim: "Mono+R",
     adj: { intensity: 100, contrast: 15, highlights: 10, shadows: -20, blacks: -25, highlightRolloff: 30, grain: 30, grainSize: 50, vignette: 25 },
     curves: { rgb: [[0, 0], [48, 20], [200, 220], [255, 255]], r: [[0, 0], [255, 255]], g: [[0, 0], [255, 255]], b: [[0, 0], [255, 255]] },
   },
@@ -234,6 +231,22 @@ function Slider({ label, value, min, max, step = 1, defaultValue = 0, onChange, 
   );
 }
 
+// ── Bottom sheet snap points ──
+const SHEET_SNAPS = [
+  80,
+  () => Math.round(window.innerHeight * 0.50),
+  () => Math.round(window.innerHeight * 0.82),
+];
+const sheetSnapPx = (i) => typeof SHEET_SNAPS[i] === 'function' ? SHEET_SNAPS[i]() : SHEET_SNAPS[i];
+const nearestSheetSnap = (px) => {
+  let closest = 1, minDist = Infinity;
+  for (let i = 0; i < SHEET_SNAPS.length; i++) {
+    const d = Math.abs(sheetSnapPx(i) - px);
+    if (d < minDist) { minDist = d; closest = i; }
+  }
+  return closest;
+};
+
 /* ── Main app ── */
 export default function App() {
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -247,6 +260,8 @@ export default function App() {
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [loadingLuts, setLoadingLuts] = useState(true);
+  const [sheetDragging, setSheetDragging] = useState(false);
+  const [lightboxUrl, setLightboxUrl] = useState(null);
 
   const canvasRef = useRef(null);
   const gpuRef = useRef(null);
@@ -256,6 +271,10 @@ export default function App() {
   const lutFileRef = useRef(null);
   const wrapperRef = useRef(null);
   const lastLutKeyRef = useRef(null);
+  const sidebarRef = useRef(null);
+  const headerRef = useRef(null);
+  const sheetDragRef = useRef({ startY: 0, startH: 0 });
+  const splitRef = useRef(null);
 
   const setField = useCallback((field, value) => {
     setAdj((prev) => ({ ...prev, [field]: value }));
@@ -464,12 +483,29 @@ export default function App() {
     });
   }, [luts]);
 
-  const handleExport = () => {
+  const handleExport = async () => {
     if (!canvasRef.current) return;
+    const filename = `graded_${activeRecipe || activePreset}.png`;
+    if (navigator.share && navigator.canShare) {
+      try {
+        const blob = await new Promise((resolve) => canvasRef.current.toBlob(resolve, "image/png"));
+        const file = new File([blob], filename, { type: "image/png" });
+        if (navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: filename });
+          return;
+        }
+      } catch (err) {
+        if (err.name !== "AbortError") console.error("Share failed:", err);
+        return;
+      }
+    }
+    const url = canvasRef.current.toDataURL("image/png");
     const link = document.createElement("a");
-    link.download = `graded_${activeRecipe || activePreset}.png`;
-    link.href = canvasRef.current.toDataURL("image/png");
+    link.download = filename;
+    link.href = url;
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
   };
 
   const handleDrop = (e) => {
@@ -483,8 +519,8 @@ export default function App() {
 
   /* ── Split view drag ── */
   const handleSplitMove = useCallback((clientX) => {
-    if (!wrapperRef.current) return;
-    const rect = wrapperRef.current.getBoundingClientRect();
+    if (!splitRef.current) return;
+    const rect = splitRef.current.getBoundingClientRect();
     setSplitPos(Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100)));
   }, []);
 
@@ -503,6 +539,84 @@ export default function App() {
       window.removeEventListener("touchend", onUp);
     };
   }, [draggingSplit, handleSplitMove]);
+
+  /* ── Mobile bottom sheet ── */
+  const applySheetH = useCallback((px, animated) => {
+    if (!sidebarRef.current || !wrapperRef.current) return;
+    const headerH = headerRef.current?.getBoundingClientRect().height || 56;
+    const vh = window.innerHeight;
+    const clamped = Math.max(SHEET_SNAPS[0], Math.min(Math.round(vh * 0.88), px));
+    const canvasH = Math.max(80, vh - headerH - clamped);
+    const trans = animated ? 'height 0.35s cubic-bezier(0.22, 1, 0.36, 1)' : 'none';
+    sidebarRef.current.style.transition = trans;
+    sidebarRef.current.style.height = `${clamped}px`;
+    sidebarRef.current.style.flex = 'none';
+    wrapperRef.current.style.transition = trans;
+    wrapperRef.current.style.height = `${canvasH}px`;
+    wrapperRef.current.style.flex = 'none';
+  }, []);
+
+  const handleSheetTouchStart = useCallback((e) => {
+    if (window.innerWidth > 640) return;
+    const sh = sidebarRef.current?.getBoundingClientRect().height ?? sheetSnapPx(1);
+    sheetDragRef.current = { startY: e.touches[0].clientY, startH: sh };
+    setSheetDragging(true);
+  }, []);
+
+  useEffect(() => {
+    if (!sheetDragging) return;
+    const onMove = (e) => {
+      e.preventDefault();
+      const dy = e.touches[0].clientY - sheetDragRef.current.startY;
+      applySheetH(sheetDragRef.current.startH - dy, false);
+    };
+    const onEnd = () => {
+      setSheetDragging(false);
+      const curH = sidebarRef.current?.getBoundingClientRect().height ?? sheetSnapPx(1);
+      applySheetH(sheetSnapPx(nearestSheetSnap(curH)), true);
+    };
+    window.addEventListener('touchmove', onMove, { passive: false });
+    window.addEventListener('touchend', onEnd);
+    return () => {
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onEnd);
+    };
+  }, [sheetDragging, applySheetH]);
+
+  useEffect(() => {
+    const init = () => {
+      if (window.innerWidth <= 640) {
+        applySheetH(sheetSnapPx(1), false);
+      } else {
+        if (sidebarRef.current) {
+          sidebarRef.current.style.height = '';
+          sidebarRef.current.style.flex = '';
+          sidebarRef.current.style.transition = '';
+        }
+        if (wrapperRef.current) {
+          wrapperRef.current.style.height = '';
+          wrapperRef.current.style.flex = '';
+          wrapperRef.current.style.transition = '';
+        }
+      }
+    };
+    init();
+    window.addEventListener('resize', init);
+    return () => window.removeEventListener('resize', init);
+  }, [applySheetH]);
+
+  /* ── Lightbox ── */
+  const openLightbox = useCallback(() => {
+    if (!canvasRef.current || !imageLoaded) return;
+    setLightboxUrl(canvasRef.current.toDataURL("image/jpeg", 0.95));
+  }, [imageLoaded]);
+
+  useEffect(() => {
+    if (!lightboxUrl) return;
+    const onKey = (e) => { if (e.key === "Escape") setLightboxUrl(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightboxUrl]);
 
   const lutNames = Object.keys(luts);
 
@@ -552,26 +666,23 @@ export default function App() {
 
   return (
     <div
+      className="app-root"
       style={{ display: "flex", flexDirection: "column", height: "100vh", background: "#111", color: "#ddd", fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif" }}
       onDrop={handleDrop}
       onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
       onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); }}
     >
       {/* ── Header ── */}
-      <div style={{ borderBottom: "1px solid #1e1e1e", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, gap: 12 }}>
+      <div ref={headerRef} className="app-header" style={{ borderBottom: "1px solid #1e1e1e", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, gap: 12 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: 15, fontWeight: 600, letterSpacing: "-0.02em", color: "#eee" }}>Film Simulations</h1>
           <p style={{ margin: "1px 0 0", fontSize: 10, color: "#555", letterSpacing: "0.08em", textTransform: "uppercase" }}>Fujifilm Colour Grading</p>
         </div>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <div className="header-actions" style={{ gap: 6, alignItems: "center" }}>
           <button onClick={() => fileRef.current?.click()} style={headerBtn}>
             {processing ? "Loading..." : "Load Image"}
           </button>
           <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
-          <button onClick={() => lutFileRef.current?.click()} style={headerBtn}>
-            {loadingLuts ? "Loading..." : `Load LUTs${lutNames.length ? ` (${lutNames.length})` : ""}`}
-          </button>
-          <input ref={lutFileRef} type="file" accept=".3dl,.cube" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files?.length) loadLUTFiles(e.target.files); }} />
           {imageLoaded && (
             <>
               <button onClick={() => setSplitView(!splitView)} style={{ ...headerBtn, ...(splitView ? { background: "#fff", color: "#111", borderColor: "#fff" } : {}) }}>
@@ -586,12 +697,13 @@ export default function App() {
       </div>
 
       {/* ── Main content ── */}
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+      <div className="app-content" style={{ overflow: "hidden" }}>
 
         {/* ── Image area ── */}
         <div
           ref={wrapperRef}
-          style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center", overflow: "hidden", position: "relative", background: "#0d0d0d", userSelect: "none" }}
+          className="app-canvas-area"
+          style={{ display: "flex", justifyContent: "center", alignItems: "center", overflow: "hidden", position: "relative", background: "#0d0d0d", userSelect: "none" }}
         >
           {!imageLoaded ? (
             <div
@@ -605,8 +717,19 @@ export default function App() {
               <p style={{ fontSize: 12, color: "#555", margin: 0 }}>or click to browse &middot; supports JPG, PNG, WebP</p>
             </div>
           ) : (
-            <>
-              <canvas ref={canvasCallbackRef} style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }} />
+            <div
+              ref={splitRef}
+              onClick={!splitView ? openLightbox : undefined}
+              style={{
+                position: "relative",
+                aspectRatio: `${dimsRef.current.w} / ${dimsRef.current.h}`,
+                maxWidth: "100%",
+                maxHeight: "100%",
+                cursor: splitView ? "default" : "zoom-in",
+                flexShrink: 0,
+              }}
+            >
+              <canvas ref={canvasCallbackRef} style={{ display: "block", width: "100%", height: "100%" }} />
               {splitView && (
                 <div
                   onMouseDown={(e) => { e.preventDefault(); setDraggingSplit(true); }}
@@ -621,13 +744,23 @@ export default function App() {
                   }}>&#9666;&#9656;</div>
                 </div>
               )}
-            </>
+            </div>
           )}
         </div>
 
         {/* ── Sidebar ── */}
-        <div style={{ width: 300, borderLeft: "1px solid #1e1e1e", overflowY: "auto", flexShrink: 0, background: "#161616" }}>
+        <div ref={sidebarRef} className="app-sidebar" style={{ borderLeft: "1px solid #1e1e1e", background: "#161616", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
+          {/* Drag handle — shown/hidden via CSS class only (no inline display) */}
+          <div
+            className="sheet-handle"
+            onTouchStart={handleSheetTouchStart}
+            style={{ justifyContent: "center", alignItems: "center", padding: "14px 0 10px", flexShrink: 0, touchAction: "none", userSelect: "none", cursor: "ns-resize" }}
+          >
+            <div style={{ width: 40, height: 4, borderRadius: 2, background: "#444" }} />
+          </div>
+
+          <div style={{ flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
           {/* Recipes */}
           <Panel title="Recipes">
             {RECIPE_CATEGORIES.map((cat) => {
@@ -731,8 +864,28 @@ export default function App() {
               </button>
             )}
           </div>
+          </div>{/* end scrollable content */}
         </div>
       </div>
+
+      {/* ── Lightbox overlay ── */}
+      {lightboxUrl && (
+        <div
+          onClick={() => setLightboxUrl(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 1000,
+            background: "rgba(0,0,0,0.97)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "zoom-out",
+          }}
+        >
+          <img
+            src={lightboxUrl}
+            draggable={false}
+            style={{ maxWidth: "100%", maxHeight: "100dvh", objectFit: "contain", userSelect: "none", display: "block" }}
+          />
+        </div>
+      )}
     </div>
   );
 }
