@@ -186,7 +186,6 @@ export default function App() {
   const headerRef = useRef(null);
   const sheetDragRef = useRef({ startY: 0, startH: 0 });
   const splitRef = useRef(null);
-  const samWorkerRef = useRef(null);
   const overlayCanvasRef = useRef(null);
 
   const setField = useCallback((field, value) => {
@@ -380,84 +379,90 @@ export default function App() {
 
   const LAYER_COLORS = [[0,210,255],[255,100,200],[255,210,0],[100,255,150]];
 
-  const addMaskAsLayer = useCallback((maskData, maskWidth, maskHeight) => {
-    const mask = { data: maskData, width: maskWidth, height: maskHeight };
-    const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
-    setSamLayers((prev) => {
-      const next = [...prev, layer];
-      setActiveLayerIdx(next.length - 1);
-      return next;
-    });
-    setSamAddingLayer(false);
+  /* ── SAM: convert image to JPEG data URI for API ── */
+  const getImageDataUri = useCallback(() => {
+    if (!originalDataRef.current) return null;
+    const { w, h } = dimsRef.current;
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    c.getContext("2d").putImageData(originalDataRef.current, 0, 0);
+    return c.toDataURL("image/jpeg", 0.85);
   }, []);
 
-  const replaceMaskOnActiveLayer = useCallback((maskData, maskWidth, maskHeight) => {
-    const mask = { data: maskData, width: maskWidth, height: maskHeight };
-    setSamLayers((prev) => prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l));
-  }, [activeLayerIdx]);
+  /* ── SAM: decode mask PNG from Replicate into binary mask array ── */
+  const decodeMaskFromUrl = useCallback((url) => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        const c = document.createElement("canvas");
+        c.width = img.width; c.height = img.height;
+        const ctx = c.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        const px = ctx.getImageData(0, 0, img.width, img.height).data;
+        const mask = new Uint8Array(img.width * img.height);
+        for (let i = 0; i < mask.length; i++) {
+          mask[i] = px[i * 4] > 128 ? 1 : 0;
+        }
+        resolve({ data: Array.from(mask), width: img.width, height: img.height });
+      };
+      img.onerror = () => reject(new Error("Failed to load mask image"));
+      img.src = url;
+    });
+  }, []);
+
+  /* ── SAM: call Replicate API via serverless proxy, return mask ── */
+  const callSamAPI = useCallback(async (x, y) => {
+    const image = getImageDataUri();
+    if (!image) throw new Error("No image loaded");
+
+    const resp = await fetch("/api/sam", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image, x: Math.round(x), y: Math.round(y) }),
+    });
+    let result = await resp.json();
+
+    // Poll if not yet complete
+    while (result.status && result.status !== "succeeded" && result.status !== "failed") {
+      await new Promise((r) => setTimeout(r, 1000));
+      const poll = await fetch(`/api/sam?pollUrl=${encodeURIComponent(result.pollUrl)}`);
+      result = await poll.json();
+    }
+
+    if (result.status === "failed" || result.error) {
+      throw new Error(result.error || "SAM prediction failed");
+    }
+
+    // Output is a mask URL (or array of URLs)
+    const output = result.output;
+    const maskUrl = Array.isArray(output) ? output[0] : (typeof output === "string" ? output : null);
+    if (!maskUrl) throw new Error("No mask in API response");
+    return decodeMaskFromUrl(maskUrl);
+  }, [getImageDataUri, decodeMaskFromUrl]);
 
   /* ── SAM: activate / deactivate ── */
-  const activateSAM = useCallback(() => {
+  const activateSAM = useCallback(async () => {
     setSamActive(true);
-    const sendEncode = (worker) => {
-      if (!originalDataRef.current) return;
-      setSamStatus("encoding");
-      const buf = originalDataRef.current.data.buffer.slice(0);
-      worker.postMessage(
-        { type: "encode", pixels: buf, width: dimsRef.current.w, height: dimsRef.current.h },
-        [buf],
-      );
-    };
+    setSamStatus("segmenting");
+    try {
+      // Auto-select: segment at center
+      const { w, h } = dimsRef.current;
+      const mask = await callSamAPI(w / 2, h / 2);
 
-    if (samWorkerRef.current) {
-      sendEncode(samWorkerRef.current);
-      return;
-    }
-    setSamStatus("loading");
-    const worker = new Worker(new URL("./sam/worker.js", import.meta.url), { type: "module" });
-    samWorkerRef.current = worker;
-    worker.onmessage = ({ data }) => {
-      switch (data.type) {
-        case "progress": break;
-        case "modelReady":
-          sendEncode(worker);
-          break;
-        case "imageReady":
-          setSamStatus("ready");
-          break;
-        case "autoMask":
-          // Auto-selected subject — create first layer automatically
-          addMaskAsLayer(data.maskData, data.maskWidth, data.maskHeight);
-          break;
-        case "maskReady":
-          setSamStatus("ready");
-          // If adding a new layer, push; otherwise replace active
-          setSamLayers((prev) => {
-            // Check samAddingLayer via ref to avoid stale closure
-            if (prev.length === 0 || samAddingLayerRef.current) {
-              const mask = { data: data.maskData, width: data.maskWidth, height: data.maskHeight };
-              const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
-              const next = [...prev, layer];
-              setActiveLayerIdx(next.length - 1);
-              setSamAddingLayer(false);
-              return next;
-            }
-            const mask = { data: data.maskData, width: data.maskWidth, height: data.maskHeight };
-            return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l);
-          });
-          break;
-        case "error":
-          console.error("SAM worker error:", data.message);
-          setSamStatus("idle");
-          break;
+      // Check coverage — skip auto-select if it got the whole background
+      const coverage = mask.data.reduce((s, v) => s + v, 0) / mask.data.length;
+      if (coverage > 0.02 && coverage < 0.5) {
+        const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
+        setSamLayers([layer]);
+        setActiveLayerIdx(0);
       }
-    };
-    worker.postMessage({ type: "load" });
-  }, [activeLayerIdx, addMaskAsLayer]);
-
-  // Ref to avoid stale closure in worker.onmessage
-  const samAddingLayerRef = useRef(false);
-  useEffect(() => { samAddingLayerRef.current = samAddingLayer; }, [samAddingLayer]);
+      setSamStatus("ready");
+    } catch (err) {
+      console.error("SAM API error:", err.message);
+      setSamStatus("ready"); // still allow manual clicks
+    }
+  }, [callSamAPI]);
 
   const deactivateSAM = useCallback(() => {
     setSamActive(false);
@@ -589,15 +594,30 @@ export default function App() {
   }, [samLayers, renderSubjectOverlay]);
 
   /* ── SAM: handle click on canvas to trigger segmentation ── */
-  const handleSamClick = useCallback((e) => {
-    if (!samActive || samStatus !== "ready" || !samWorkerRef.current) return;
+  const handleSamClick = useCallback(async (e) => {
+    if (!samActive || samStatus !== "ready") return;
     e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width * dimsRef.current.w;
     const y = (e.clientY - rect.top) / rect.height * dimsRef.current.h;
     setSamStatus("segmenting");
-    samWorkerRef.current.postMessage({ type: "segment", x, y });
-  }, [samActive, samStatus]);
+    try {
+      const mask = await callSamAPI(x, y);
+      setSamLayers((prev) => {
+        if (prev.length === 0 || samAddingLayer) {
+          const layer = { id: Date.now(), mask, preset: "original", adj: { ...DEFAULT_ADJ } };
+          const next = [...prev, layer];
+          setActiveLayerIdx(next.length - 1);
+          setSamAddingLayer(false);
+          return next;
+        }
+        return prev.map((l, i) => i === activeLayerIdx ? { ...l, mask } : l);
+      });
+    } catch (err) {
+      console.error("SAM API error:", err.message);
+    }
+    setSamStatus("ready");
+  }, [samActive, samStatus, samAddingLayer, activeLayerIdx, callSamAPI]);
 
   /* ── GPU render pass ── */
   const processImage = useCallback(() => {
