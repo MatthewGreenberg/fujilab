@@ -716,7 +716,7 @@ export default function App() {
       <div ref={headerRef} className="app-header" style={{ borderBottom: "1px solid #1e1e1e", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, gap: 12 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: 15, fontWeight: 600, letterSpacing: "-0.02em", color: "#eee" }}>Fujilab</h1>
-          <p style={{ margin: "1px 0 0", fontSize: 10, color: "#555", letterSpacing: "0.08em", textTransform: "uppercase" }}>Fujifilm Film Simulations</p>
+          <p style={{ margin: "1px 0 0", fontSize: 10, color: "#555", letterSpacing: "0.08em", textTransform: "uppercase" }}>Fujifilm Film Simulations · v0.1</p>
         </div>
         <div className="header-actions" style={{ gap: 6, alignItems: "center" }}>
           <a
