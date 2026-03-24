@@ -502,47 +502,59 @@ export default function App() {
     overlayCanvas.height = h;
     const ctx = overlayCanvas.getContext("2d");
     ctx.clearRect(0, 0, w, h);
-    ctx.putImageData(new ImageData(out, w, h), 0, 0);
 
-    // Draw mask edge outline for selection visibility
-    // Dim non-selected area slightly
+    // 1. Strong dim on non-selected background
     const dimData = ctx.createImageData(w, h);
     for (let i = 0; i < w * h; i++) {
       if (!maskData[i]) {
-        dimData.data[i * 4 + 3] = 40; // subtle dark overlay on background
+        dimData.data[i * 4 + 3] = 100; // noticeable dark veil on background
       }
     }
     ctx.putImageData(dimData, 0, 0);
-    // Re-draw subject pixels on top of the dim
+
+    // 2. Draw subject pixels on top (masked, fully opaque)
     ctx.putImageData(new ImageData(out, w, h), 0, 0);
 
-    // Draw edge outline by finding mask boundary pixels
-    const edgeData = ctx.createImageData(w, h);
+    // 3. Build thick edge mask (2px radius) with cyan color
+    const edgeFlags = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const idx = y * w + x;
         if (!maskData[idx]) continue;
-        // Check if any 4-connected neighbor is outside mask
-        const isEdge =
-          (x === 0 || !maskData[idx - 1]) ||
-          (x === w - 1 || !maskData[idx + 1]) ||
-          (y === 0 || !maskData[idx - w]) ||
-          (y === h - 1 || !maskData[idx + w]);
-        if (isEdge) {
-          const pi = idx * 4;
-          edgeData.data[pi] = 255;
-          edgeData.data[pi + 1] = 255;
-          edgeData.data[pi + 2] = 255;
-          edgeData.data[pi + 3] = 180;
+        let onEdge = false;
+        for (let dy = -2; dy <= 2 && !onEdge; dy++) {
+          for (let dx = -2; dx <= 2 && !onEdge; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const ny = y + dy, nx = x + dx;
+            if (ny < 0 || ny >= h || nx < 0 || nx >= w || !maskData[ny * w + nx]) onEdge = true;
+          }
         }
+        if (onEdge) edgeFlags[idx] = 1;
       }
     }
-    // Draw edge as a separate pass so it composites on top
+    const edgeData = ctx.createImageData(w, h);
+    for (let i = 0; i < w * h; i++) {
+      if (edgeFlags[i]) {
+        const pi = i * 4;
+        edgeData.data[pi] = 0;
+        edgeData.data[pi + 1] = 210;
+        edgeData.data[pi + 2] = 255;
+        edgeData.data[pi + 3] = 220;
+      }
+    }
+
+    // 4. Draw glow (blurred edge) then sharp edge on top
     const edgeCanvas = document.createElement("canvas");
     edgeCanvas.width = w;
     edgeCanvas.height = h;
     const edgeCtx = edgeCanvas.getContext("2d");
     edgeCtx.putImageData(edgeData, 0, 0);
+
+    ctx.save();
+    ctx.filter = "blur(4px)";
+    ctx.globalAlpha = 0.55;
+    ctx.drawImage(edgeCanvas, 0, 0);
+    ctx.restore();
     ctx.drawImage(edgeCanvas, 0, 0);
   }, [samMask, subjectAdj, subjectPreset, luts]);
 
@@ -630,6 +642,7 @@ export default function App() {
       lastLutKeyRef.current = null;
       if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
       setSplitView(false);
+      setAdj(prev => ({ ...prev })); // invalidate processImage so effect re-fires with new image
       setImageLoaded(true);
       setProcessing(false);
     };
@@ -939,7 +952,7 @@ export default function App() {
               </button>
               <button
                 onClick={samActive ? deactivateSAM : activateSAM}
-                className={`header-btn${samActive ? " active" : ""}`}
+                className={`header-btn sam-btn${samActive ? " active" : ""}`}
                 title="Click on any subject to apply a separate film simulation"
               >
                 {samStatus === "loading" || samStatus === "encoding" ? "Loading AI…" : "Select Subject"}
@@ -1110,33 +1123,55 @@ export default function App() {
 
           {/* ── Subject Layer (SAM) ── */}
           {samActive && samMask && (
-            <Panel title="Subject Layer" defaultOpen={true}>
-              <div style={{ fontSize: 11, color: "#666", marginBottom: 8, lineHeight: 1.4 }}>
-                Independent film sim applied only to the selected subject.
+            <div className="sam-subject-panel" style={{
+              margin: "8px 10px 4px",
+              background: "linear-gradient(135deg, rgba(0,210,255,0.06) 0%, rgba(0,140,200,0.03) 100%)",
+              border: "1px solid rgba(0,210,255,0.18)",
+              borderRadius: 8,
+              overflow: "hidden",
+              animation: "samPanelIn 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+            }}>
+              {/* Header bar */}
+              <div style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                padding: "10px 12px 8px",
+                borderBottom: "1px solid rgba(0,210,255,0.1)",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                  <div style={{
+                    width: 18, height: 18, borderRadius: 4,
+                    background: "linear-gradient(135deg, #00d2ff 0%, #0090cc 100%)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 9, fontWeight: 700, color: "#000", letterSpacing: "-0.02em",
+                  }}>AI</div>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#ccc", letterSpacing: "0.01em" }}>Subject Layer</span>
+                </div>
+                <button
+                  onClick={() => { setSamMask(null); if (overlayCanvasRef.current) { overlayCanvasRef.current.getContext("2d").clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height); } }}
+                  style={{
+                    padding: "3px 8px", fontSize: 9, fontWeight: 500, fontFamily: "inherit",
+                    background: "rgba(255,255,255,0.06)", color: "#888",
+                    border: "1px solid rgba(255,255,255,0.08)", borderRadius: 4,
+                    cursor: "pointer", letterSpacing: "0.02em",
+                  }}
+                >Clear</button>
               </div>
-              {/* Subject film simulation */}
-              <div style={{ marginBottom: 10 }}>
-                <div style={{ fontSize: 10, color: "#555", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 5 }}>Film Simulation</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+              {/* Body */}
+              <div style={{ padding: "10px 12px 12px" }}>
+                <div style={{ fontSize: 10, color: "rgba(0,210,255,0.5)", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6, fontWeight: 500 }}>Film Simulation</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
                   <button onClick={() => setSubjectPreset("original")} style={presetBtn(subjectPreset === "original")}>None</button>
                   {visibleLutNames.map((name) => (
                     <button key={name} onClick={() => setSubjectPreset(name)} style={presetBtn(subjectPreset === name)}>{name}</button>
                   ))}
                 </div>
+                <Slider label="Intensity" value={subjectAdj.intensity} min={0} max={100} defaultValue={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, intensity: v }))} format={pctFmt} />
+                <Slider label="Highlights" value={subjectAdj.highlights} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, highlights: v }))} format={signFmt} />
+                <Slider label="Shadows" value={subjectAdj.shadows} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, shadows: v }))} format={signFmt} />
+                <Slider label="Temperature" value={subjectAdj.temperature} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, temperature: v }))} format={signFmt} />
+                <Slider label="Saturation" value={subjectAdj.saturation} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, saturation: v }))} format={signFmt} />
               </div>
-              <Slider label="Intensity" value={subjectAdj.intensity} min={0} max={100} defaultValue={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, intensity: v }))} format={pctFmt} />
-              <Slider label="Highlights" value={subjectAdj.highlights} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, highlights: v }))} format={signFmt} />
-              <Slider label="Shadows" value={subjectAdj.shadows} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, shadows: v }))} format={signFmt} />
-              <Slider label="Temperature" value={subjectAdj.temperature} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, temperature: v }))} format={signFmt} />
-              <Slider label="Saturation" value={subjectAdj.saturation} min={-100} max={100} onChange={(v) => setSubjectAdj((a) => ({ ...a, saturation: v }))} format={signFmt} />
-              <button
-                onClick={() => { setSamMask(null); if (overlayCanvasRef.current) { overlayCanvasRef.current.getContext("2d").clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height); } }}
-                className="action-btn"
-                style={{ marginTop: 4 }}
-              >
-                Clear Selection
-              </button>
-            </Panel>
+            </div>
           )}
 
           {/* Film Simulation */}

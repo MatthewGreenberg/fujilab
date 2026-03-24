@@ -18,6 +18,19 @@
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+@keyframes samPanelIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* SAM subject panel hover glow */
+.sam-subject-panel {
+  transition: border-color 0.2s;
+}
+.sam-subject-panel:hover {
+  border-color: rgba(0, 210, 255, 0.3) !important;
+}
+
 body {
   margin: 0;
   background: #111;
@@ -83,6 +96,12 @@ button:active:not(:disabled) {
   background: #fff;
   color: #111;
   border-color: #fff;
+}
+.header-btn.active.sam-btn {
+  background: linear-gradient(135deg, #00d2ff, #0090cc);
+  color: #000;
+  border-color: #00b8e6;
+  font-weight: 600;
 }
 .header-btn.primary {
   background: #fff;
