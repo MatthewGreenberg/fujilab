@@ -430,7 +430,7 @@ export default function App() {
         for (let i = 0; i < mask.length; i++) {
           mask[i] = px[i * 4] > 128 ? 1 : 0;
         }
-        resolve({ data: Array.from(mask), width: img.width, height: img.height });
+        resolve({ data: mask, width: img.width, height: img.height });
       };
       img.onerror = () => reject(new Error("Failed to load mask image"));
       img.src = url;
@@ -511,7 +511,7 @@ export default function App() {
         }
       }
 
-      const mask = { data: Array.from(alpha), width: w, height: h };
+      const mask = { data: alpha, width: w, height: h };
       const coverage = alpha.reduce((s, v) => s + (v > 128 ? 1 : 0), 0) / alpha.length;
       console.log(`RMBG inference in ${(performance.now() - t1).toFixed(0)}ms, coverage: ${(coverage * 100).toFixed(1)}%`);
 
@@ -753,7 +753,7 @@ export default function App() {
     // Snapshot mask data into mutable ref
     const layer = samLayers[activeLayerIdx];
     paintMaskRef.current = {
-      data: [...layer.mask.data],
+      data: new Uint8Array(layer.mask.data),
       width: layer.mask.width,
       height: layer.mask.height,
       mode: brushMode,
@@ -856,8 +856,8 @@ export default function App() {
       setImageLoaded(true);
       setProcessing(false);
       setSamLayers([]);
-      // Preload RMBG model in background so it's ready when needed
-      loadRMBG().catch(() => {});
+      // Preload RMBG model in background so it's ready when needed (desktop only)
+      if (window.innerWidth > 640) loadRMBG().catch(() => {});
       setSamActive(false);
       setSamStatus("idle");
       setSamAddingLayer(false);
@@ -1143,7 +1143,8 @@ export default function App() {
   useEffect(() => {
     const init = () => {
       if (window.innerWidth <= 640) {
-        applySheetH(sheetSnapPx(1), false);
+        // Start sheet minimized when no image loaded so upload area has room
+        applySheetH(imageLoaded ? sheetSnapPx(1) : SHEET_SNAPS[0], false);
       } else {
         if (sidebarRef.current) {
           sidebarRef.current.style.height = '';
@@ -1160,7 +1161,7 @@ export default function App() {
     init();
     window.addEventListener('resize', init);
     return () => window.removeEventListener('resize', init);
-  }, [applySheetH]);
+  }, [applySheetH, imageLoaded]);
 
   /* ── Lightbox ── */
   const openLightbox = useCallback(() => {
@@ -1263,9 +1264,6 @@ export default function App() {
                   : samActive ? "Done"
                   : samLayers.length > 0 ? "Edit Mask"
                   : "Select Subject"}
-              </button>
-              <button onClick={shareRecipeLink} className={`header-btn${shareCopied ? " success" : ""}`}>
-                {shareCopied ? "Copied" : "Share"}
               </button>
               <button onClick={() => setExportModalOpen(true)} className="header-btn primary">
                 Export
@@ -1584,12 +1582,22 @@ export default function App() {
           <div style={{ flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
           {/* Recipes */}
           <Panel title="Recipes" defaultOpen={true}>
-            <button
-              onClick={() => { setPasteModalOpen(true); setPasteWarnings([]); }}
-              className="paste-recipe-btn"
-            >
-              Paste a Recipe
-            </button>
+            <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+              <button
+                onClick={() => { setPasteModalOpen(true); setPasteWarnings([]); }}
+                className="paste-recipe-btn"
+                style={{ flex: 1 }}
+              >
+                Paste a Recipe
+              </button>
+              <button
+                onClick={shareRecipeLink}
+                className={`paste-recipe-btn${shareCopied ? " success" : ""}`}
+                style={{ flex: 1 }}
+              >
+                {shareCopied ? "Copied!" : "Share Recipe"}
+              </button>
+            </div>
             {RECIPE_CATEGORIES.map((cat, catIdx) => {
               const catRecipes = RECIPES.filter((r) => r.category === cat);
               if (catRecipes.length === 0) return null;
