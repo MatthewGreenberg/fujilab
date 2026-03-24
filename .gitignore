@@ -24,3 +24,14 @@ dist-ssr
 *.sw?
 .vercel
 .env*.local
+
+# AI tooling
+.claude/
+.cursor/
+
+# Internal docs
+docs/
+
+# Large dev/test RAW files
+public/*.RAF
+public/*.RAF.tiff

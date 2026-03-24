@@ -2,23 +2,50 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { parse3DL, parseCube } from "./lut";
 import CurveEditor, { buildCurveLUT } from "./CurveEditor";
 import { createRenderer, isWebGL2Supported } from "./gpu/renderer";
-import LibRaw from "libraw-wasm";
+import { LibRaw } from "libraw-mini";
+import { parseRecipe } from "./recipeParser";
+import { RECIPES, RECIPE_CATEGORIES } from "./recipes";
 
-/* Decode a RAF file's raw sensor data via LibRaw-Wasm. Returns ImageData + dimensions. */
+/* Decode a RAF file's raw sensor data via libraw-mini (Emscripten WASM port). */
 async function decodeRaf(arrayBuffer) {
-  const raw = new LibRaw();
-  await raw.open(new Uint8Array(arrayBuffer), {
-    useCameraWb: true,
-    outputBps: 8,
-    halfSize: false,
-  });
-  const meta = await raw.metadata();
-  const rgb = await raw.imageData(); // Uint8Array, 3 bytes per pixel (RGB)
-  const w = meta.width, h = meta.height;
-  // Convert RGB → RGBA for ImageData
+  const raw = await new LibRaw();
+
+  const openResult = await raw.open(new Uint8Array(arrayBuffer), null);
+
+  // Set params after open, before processing. use_camera_wb for proper color.
+  await raw.setparams({ use_camera_wb: 1 });
+
+  // A progress callback MUST be provided — without one, the first progress
+  // message resolves the promise prematurely instead of the actual image data.
+  const result = await raw.getimage(() => {});
+  await raw.close();
+
+  if (!result || !result.data || result.data.length === 0) {
+    throw new Error(`RAW decode returned empty data (getimage returned: ${JSON.stringify(result, (k, v) => v instanceof Uint8Array ? `Uint8Array(${v.length})` : v)})`);
+  }
+
+  const w = result.width;
+  const h = result.height;
+  const rgb = result.data;
+
+  // LibRaw WASM outputs linear data — apply sRGB gamma so it looks correct.
+  // Pre-compute a 256-entry lookup table for the conversion.
+  const gammaLUT = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const v = i / 255;
+    gammaLUT[i] = Math.round((v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055) * 255);
+  }
+
   const rgba = new Uint8Array(w * h * 4);
-  for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
-    rgba[j] = rgb[i]; rgba[j + 1] = rgb[i + 1]; rgba[j + 2] = rgb[i + 2]; rgba[j + 3] = 255;
+  const bytesPerPixel = rgb.length / (w * h);
+  if (bytesPerPixel === 4) {
+    for (let i = 0, j = 0; i < rgb.length; i += 4, j += 4) {
+      rgba[j] = gammaLUT[rgb[i]]; rgba[j + 1] = gammaLUT[rgb[i + 1]]; rgba[j + 2] = gammaLUT[rgb[i + 2]]; rgba[j + 3] = 255;
+    }
+  } else {
+    for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+      rgba[j] = gammaLUT[rgb[i]]; rgba[j + 1] = gammaLUT[rgb[i + 1]]; rgba[j + 2] = gammaLUT[rgb[i + 2]]; rgba[j + 3] = 255;
+    }
   }
   return { imageData: new ImageData(new Uint8ClampedArray(rgba.buffer), w, h), w, h };
 }
@@ -65,139 +92,6 @@ const DEFAULT_CURVES = {
   g: [[0, 0], [255, 255]],
   b: [[0, 0], [255, 255]],
 };
-
-/*
-  Recipes based on FujiXWeekly's most popular film simulation recipes (2025).
-  Camera settings mapped to our app's adjustment parameters.
-  Recipes using film sims we lack LUTs for (Classic Neg, Eterna, Nostalgic Neg,
-  Reala Ace) are approximated with the closest available XTrans III simulation.
-  Source: fujixweekly.com
-*/
-const RECIPES = [
-  // ── Kodak Film Emulations ──
-  {
-    name: "Reggie's Portra",
-    category: "Kodak",
-    description: "#1 FujiXWeekly recipe of 2025",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.3, highlights: -20, shadows: -20, temperature: 12, tint: 3, saturation: 10, vibrance: 8, highlightRolloff: 20, colorChrome: 70, grain: 15, grainSize: 20 },
-  },
-  {
-    name: "Kodachrome 64",
-    category: "Kodak",
-    description: "Vivid vintage slide film",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.2, contrast: 8, temperature: 14, tint: 2, saturation: 10, vibrance: 8, highlightRolloff: 25, colorChrome: 70, colorChromeFxBlue: 35, grain: 15, grainSize: 20 },
-  },
-  {
-    name: "Kodak Gold 200",
-    category: "Kodak",
-    description: "Warm consumer film tones",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.5, contrast: -3, highlights: -30, shadows: 10, temperature: 18, tint: 4, saturation: 15, vibrance: 12, highlightRolloff: 40, colorChrome: 35, grain: 35, grainSize: 20 },
-  },
-  {
-    name: "Portra 400",
-    category: "Kodak",
-    description: "The portrait film king",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.35, highlights: 0, shadows: -40, temperature: 10, saturation: 10, vibrance: 8, highlightRolloff: 40, colorChrome: 70, grain: 35, grainSize: 20 },
-  },
-  {
-    name: "Portra 800",
-    category: "Kodak",
-    description: "Warm grainy high-speed film",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.5, contrast: -5, highlights: -40, shadows: -10, temperature: 22, tint: -3, saturation: 15, vibrance: 12, highlightRolloff: 40, colorChrome: 70, grain: 35, grainSize: 75 },
-  },
-  {
-    name: "McCurry Kodachrome",
-    category: "Kodak",
-    description: "National Geographic colors",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, temperature: 3, tint: 5, saturation: 10, vibrance: 8, highlightRolloff: 10, colorChrome: 70, grain: 15, grainSize: 20 },
-  },
-  // ── Cinematic ──
-  {
-    name: "CineStill 800T",
-    category: "Cinematic",
-    description: "Tungsten cinema film &middot; cool blue cast",
-    filmSim: "Pro Neg Std",
-    adj: { intensity: 90, exposure: 0.1, contrast: -10, highlights: -15, shadows: 30, temperature: -12, tint: -4, saturation: 12, vibrance: 10, highlightRolloff: 55, colorChrome: 50, colorChromeFxBlue: 35, grain: 35, grainSize: 75 },
-  },
-  {
-    name: "Vibrant Arizona",
-    category: "Cinematic",
-    description: "Wes Anderson palette",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.5, contrast: -5, temperature: 18, tint: 8, saturation: 20, vibrance: 15, highlightRolloff: 55, colorChromeFxBlue: 35, grain: 15, grainSize: 20 },
-  },
-  {
-    name: "Cinematic Teal",
-    category: "Cinematic",
-    description: "Teal shadows, warm highlights",
-    filmSim: "Pro Neg Std",
-    adj: { intensity: 90, contrast: 8, highlights: -20, shadows: 10, temperature: -8, tint: -3, saturation: -15, highlightRolloff: 60, colorChrome: 35, vignette: 20, fade: 4 },
-    curves: { rgb: [[0, 0], [64, 50], [192, 210], [255, 255]], r: [[0, 0], [128, 135], [255, 255]], g: [[0, 0], [255, 255]], b: [[0, 12], [128, 138], [255, 245]] },
-  },
-  // ── Street ──
-  {
-    name: "Pacific Blues",
-    category: "Street",
-    description: "Punchy street color",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 90, exposure: 0.5, contrast: -5, highlights: -40, shadows: 60, temperature: 12, saturation: 20, vibrance: 15, highlightRolloff: 40, colorChrome: 70, colorChromeFxBlue: 35, grain: 40, grainSize: 75 },
-  },
-  {
-    name: "Classic Color",
-    category: "Street",
-    description: "Versatile everyday film",
-    filmSim: "Classic Chrome",
-    adj: { intensity: 95, exposure: 0.3, contrast: -3, highlights: -10, shadows: -40, temperature: 6, saturation: 15, vibrance: 12, highlightRolloff: 40, colorChrome: 70, colorChromeFxBlue: 35, grain: 35, grainSize: 20 },
-  },
-  // ── Fuji ──
-  {
-    name: "Fujifilm Negative",
-    category: "Fuji",
-    description: "Clean natural film tones",
-    filmSim: "Provia",
-    adj: { intensity: 90, exposure: 0.35, contrast: -3, highlights: -20, shadows: -10, temperature: 1, saturation: 10, vibrance: 8, highlightRolloff: 40, colorChrome: 70, grain: 15, grainSize: 20 },
-  },
-  {
-    name: "California Summer",
-    category: "Fuji",
-    description: "Golden warm nostalgia",
-    filmSim: "Astia",
-    adj: { intensity: 90, exposure: 0.6, contrast: -8, highlights: -40, shadows: -20, temperature: 28, tint: -2, saturation: 20, vibrance: 15, highlightRolloff: 40, colorChrome: 70, colorChromeFxBlue: 35, grain: 15, grainSize: 20 },
-  },
-  {
-    name: "Soft Portrait",
-    category: "Fuji",
-    description: "Flattering skin, gentle tones",
-    filmSim: "Pro Neg Hi",
-    adj: { intensity: 90, exposure: 0.15, contrast: -8, highlights: -15, shadows: 10, temperature: 6, tint: 3, vibrance: -8, highlightRolloff: 50, grain: 5, grainSize: 15 },
-  },
-  // ── B&W ──
-  {
-    name: "Tri-X 400",
-    category: "B&W",
-    description: "Classic gritty photojournalism",
-    filmSim: "Acros",
-    adj: { intensity: 100, exposure: 0.35, contrast: 12, shadows: 60, temperature: 25, tint: 10, highlightRolloff: 25, colorChrome: 70, grain: 40, grainSize: 75 },
-  },
-  {
-    name: "Film Noir",
-    category: "B&W",
-    description: "Deep shadows, high drama",
-    filmSim: "Mono+R",
-    adj: { intensity: 100, contrast: 15, highlights: 10, shadows: -20, blacks: -25, highlightRolloff: 30, grain: 30, grainSize: 50, vignette: 25 },
-    curves: { rgb: [[0, 0], [48, 20], [200, 220], [255, 255]], r: [[0, 0], [255, 255]], g: [[0, 0], [255, 255]], b: [[0, 0], [255, 255]] },
-  },
-];
-
-const RECIPE_CATEGORIES = ["Kodak", "Cinematic", "Street", "Fuji", "B&W"];
-
-// clamp, grainHash, rgbHue — now handled by the GLSL fragment shader
 
 /* ── Collapsible panel ── */
 function Panel({ title, children, defaultOpen = true }) {
@@ -251,6 +145,28 @@ function Slider({ label, value, min, max, step = 1, defaultValue = 0, onChange, 
   );
 }
 
+/* ── Collapsible recipe category ── */
+function RecipeCategory({ label, children, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div
+        onClick={() => setOpen(!open)}
+        style={{
+          fontSize: 9, fontWeight: 600, color: "#555", textTransform: "uppercase",
+          letterSpacing: "0.08em", marginBottom: open ? 4 : 0, cursor: "pointer",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          padding: "4px 0", userSelect: "none",
+        }}
+      >
+        {label}
+        <span style={{ fontSize: 7, color: "#444", transition: "transform 0.15s", transform: open ? "rotate(0)" : "rotate(-90deg)" }}>&#9660;</span>
+      </div>
+      {open && <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>{children}</div>}
+    </div>
+  );
+}
+
 // ── Bottom sheet snap points ──
 const SHEET_SNAPS = [
   80,
@@ -280,13 +196,23 @@ export default function App() {
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [loadingLuts, setLoadingLuts] = useState(true);
-  const [decodingRaw, setDecodingRaw] = useState(false);
+  const [decodingRaw, setDecodingRaw] = useState(false); // false | "decoding" | {error: string}
   const [sheetDragging, setSheetDragging] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState(null);
+  const [pasteModalOpen, setPasteModalOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteWarnings, setPasteWarnings] = useState([]);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [exportFormat, setExportFormat] = useState("jpeg");
+  const [exportQuality, setExportQuality] = useState(92);
+  const [exportFullRes, setExportFullRes] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
 
   const canvasRef = useRef(null);
   const gpuRef = useRef(null);
   const originalDataRef = useRef(null);
+  const sourceBlobRef = useRef(null);  // original file blob for full-res re-decode
   const dimsRef = useRef({ w: 0, h: 0 });
   const fileRef = useRef(null);
   const lutFileRef = useRef(null);
@@ -307,6 +233,90 @@ export default function App() {
     setAdj({ ...DEFAULT_ADJ, ...recipe.adj });
     setCurves(recipe.curves ? { ...DEFAULT_CURVES, ...recipe.curves } : DEFAULT_CURVES);
     setActiveRecipe(recipe.name);
+  }, []);
+
+  const handlePasteRecipe = useCallback(() => {
+    if (!pasteText.trim()) return;
+    const result = parseRecipe(pasteText);
+    setPasteWarnings(result.warnings);
+    const recipe = {
+      name: "Pasted Recipe",
+      filmSim: result.filmSim || "original",
+      adj: result.adj,
+    };
+    applyRecipe(recipe);
+    setPasteText("");
+    if (result.warnings.length === 0) {
+      setPasteModalOpen(false);
+    }
+    // warnings stay visible so user can see approximations
+  }, [pasteText, applyRecipe]);
+
+  /* ── Shareable recipe links ── */
+  const encodeRecipeToURL = useCallback(() => {
+    // Encode only non-default adj values + preset to keep URLs short
+    const params = new URLSearchParams();
+    if (activePreset !== "original") params.set("sim", activePreset);
+    for (const [key, val] of Object.entries(adj)) {
+      if (val !== DEFAULT_ADJ[key]) params.set(key, val);
+    }
+    // Encode curves if non-default
+    const curvesChanged = JSON.stringify(curves) !== JSON.stringify(DEFAULT_CURVES);
+    if (curvesChanged) params.set("curves", btoa(JSON.stringify(curves)));
+    if (activeRecipe) params.set("name", activeRecipe);
+    return `${window.location.origin}${window.location.pathname}#${params.toString()}`;
+  }, [activePreset, adj, curves, activeRecipe]);
+
+  const shareRecipeLink = useCallback(async () => {
+    const url = encodeRecipeToURL();
+    try {
+      await navigator.clipboard.writeText(url);
+      setShareCopied(true);
+      setTimeout(() => setShareCopied(false), 2000);
+    } catch {
+      // Fallback: select in a temporary input
+      const input = document.createElement("input");
+      input.value = url;
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      document.body.removeChild(input);
+      setShareCopied(true);
+      setTimeout(() => setShareCopied(false), 2000);
+    }
+  }, [encodeRecipeToURL]);
+
+  // Read recipe from URL hash on mount
+  useEffect(() => {
+    const hash = window.location.hash.slice(1);
+    if (!hash) return;
+    try {
+      const params = new URLSearchParams(hash);
+      const newAdj = { ...DEFAULT_ADJ };
+      let preset = "original";
+      let recipeName = null;
+      let newCurves = DEFAULT_CURVES;
+
+      if (params.has("sim")) preset = params.get("sim");
+      if (params.has("name")) recipeName = params.get("name");
+      if (params.has("curves")) {
+        try { newCurves = JSON.parse(atob(params.get("curves"))); } catch { /* ignore malformed curves */ }
+      }
+
+      for (const [key, val] of params.entries()) {
+        if (key === "sim" || key === "name" || key === "curves") continue;
+        if (key in DEFAULT_ADJ) {
+          newAdj[key] = Number(val);
+        }
+      }
+
+      setActivePreset(preset);
+      setAdj(newAdj);
+      setCurves(newCurves);
+      setActiveRecipe(recipeName || "Shared Recipe");
+      // Clean up URL without reload
+      window.history.replaceState(null, "", window.location.pathname);
+    } catch { /* ignore malformed URL hash */ }
   }, []);
 
   /* ── Load bundled LUTs ── */
@@ -491,6 +501,14 @@ export default function App() {
     img.src = url;
   }, []);
 
+  /* ── Load sample image on demand ── */
+  const loadSampleImage = useCallback(() => {
+    fetch("/boat.jpeg")
+      .then((r) => r.ok ? r.blob() : null)
+      .then((blob) => { if (blob) loadImageFromBlob(blob); })
+      .catch(() => {}); // sample image missing — fine
+  }, [loadImageFromBlob]);
+
   /* ── File loading ── */
   const loadImageFile = useCallback((file) => {
     if (!file) return;
@@ -498,6 +516,8 @@ export default function App() {
     const isImage = file.type.startsWith("image/");
     if (!isRaf && !isImage) return;
     setProcessing(true);
+
+    sourceBlobRef.current = file;  // keep for full-res export
 
     if (isRaf) {
       const reader = new FileReader();
@@ -509,7 +529,7 @@ export default function App() {
           loadImageFromBlob(jpegBlob);
         }
         // 2. Background: decode full RAW sensor data via LibRaw-Wasm
-        setDecodingRaw(true);
+        setDecodingRaw("decoding");
         decodeRaf(buffer)
           .then(({ imageData, w, h }) => {
             // Scale down if needed (same max as regular images)
@@ -521,7 +541,6 @@ export default function App() {
               const offscreen = document.createElement("canvas");
               offscreen.width = sw; offscreen.height = sh;
               const ctx = offscreen.getContext("2d");
-              // Draw the decoded ImageData to a temp canvas, then scale
               const tmp = document.createElement("canvas");
               tmp.width = w; tmp.height = h;
               tmp.getContext("2d").putImageData(imageData, 0, 0);
@@ -534,13 +553,13 @@ export default function App() {
             lastLutKeyRef.current = null;
             if (gpuRef.current) gpuRef.current.uploadImage(imageData, w, h);
             setDecodingRaw(false);
-            // Trigger re-render with decoded data
             setAdj((prev) => ({ ...prev }));
           })
           .catch((err) => {
-            console.error("RAW decode failed:", err);
-            setDecodingRaw(false);
-            // JPEG preview remains as fallback
+            const msg = err?.message || String(err);
+            console.warn("RAW decode failed:", msg);
+            setDecodingRaw({ error: msg });
+            setTimeout(() => setDecodingRaw((v) => v && v.error ? false : v), 6000);
           });
       };
       reader.onerror = () => setProcessing(false);
@@ -570,29 +589,95 @@ export default function App() {
     });
   }, [luts]);
 
-  const handleExport = async () => {
+  const doExport = async () => {
     if (!canvasRef.current) return;
-    const filename = `graded_${activeRecipe || activePreset}.png`;
-    if (navigator.share && navigator.canShare) {
-      try {
-        const blob = await new Promise((resolve) => canvasRef.current.toBlob(resolve, "image/png"));
-        const file = new File([blob], filename, { type: "image/png" });
-        if (navigator.canShare({ files: [file] })) {
-          await navigator.share({ files: [file], title: filename });
-          return;
+    setExporting(true);
+    try {
+      let exportCanvas = canvasRef.current;
+
+      // Full-res export: re-decode source at native resolution, render in offscreen GPU
+      if (exportFullRes && sourceBlobRef.current) {
+        const blob = sourceBlobRef.current;
+        const isRaf = blob.name?.toLowerCase().endsWith(".raf");
+        let fullImageData, fw, fh;
+
+        if (isRaf) {
+          const buffer = await blob.arrayBuffer();
+          const result = await decodeRaf(buffer);
+          fullImageData = result.imageData; fw = result.w; fh = result.h;
+        } else {
+          const url = URL.createObjectURL(blob);
+          const img = await new Promise((resolve, reject) => {
+            const i = new Image();
+            i.onload = () => { URL.revokeObjectURL(url); resolve(i); };
+            i.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Failed to load")); };
+            i.src = url;
+          });
+          fw = img.naturalWidth; fh = img.naturalHeight;
+          const oc = document.createElement("canvas");
+          oc.width = fw; oc.height = fh;
+          oc.getContext("2d").drawImage(img, 0, 0);
+          fullImageData = oc.getContext("2d").getImageData(0, 0, fw, fh);
         }
-      } catch (err) {
-        if (err.name !== "AbortError") console.error("Share failed:", err);
-        return;
+
+        // Render at full res in an offscreen canvas
+        const offCanvas = document.createElement("canvas");
+        offCanvas.width = fw; offCanvas.height = fh;
+        const offGpu = createRenderer(offCanvas);
+        offGpu.uploadImage(fullImageData, fw, fh);
+        const lut = luts[activePreset];
+        if (lut) offGpu.uploadLUT(lut.data, lut.size);
+        const tables = buildCurveTables();
+        offGpu.uploadCurveLUTs(tables.r, tables.g, tables.b);
+        offGpu.render({
+          lutSize: lut ? lut.size : 0, hasLut: !!lut,
+          intensity: adj.intensity / 100,
+          highlights: adj.highlights, shadows: adj.shadows,
+          temperature: adj.temperature, tint: adj.tint,
+          saturation: adj.saturation, vibrance: adj.vibrance,
+          colorChrome: adj.colorChrome / 100, colorChromeFxBlue: adj.colorChromeFxBlue / 100,
+          vignette: adj.vignette / 100,
+          grain: adj.grain / 100, grainAmp: 55 + (adj.grainSize / 100) * 35,
+          grainCellSize: 1.0 + (adj.grainSize / 100) * 2.5,
+          splitView: false, splitPos: 50,
+        });
+        exportCanvas = offCanvas;
+        // Clean up offscreen GPU after we get the blob
+        setTimeout(() => offGpu.destroy(), 100);
       }
+
+      const ext = exportFormat === "png" ? "png" : "jpg";
+      const mime = exportFormat === "png" ? "image/png" : "image/jpeg";
+      const filename = `fujilab_${activeRecipe || activePreset}.${ext}`;
+      const blob = await new Promise((resolve) =>
+        exportCanvas.toBlob(resolve, mime, exportFormat === "png" ? undefined : exportQuality / 100)
+      );
+
+      if (window.innerWidth <= 640 && navigator.share && navigator.canShare) {
+        try {
+          const file = new File([blob], filename, { type: mime });
+          if (navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: filename });
+            setExportModalOpen(false);
+            return;
+          }
+        } catch (err) {
+          if (err.name === "AbortError") return;
+        }
+      }
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.download = filename;
+      link.href = url;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setExportModalOpen(false);
+    } finally {
+      setExporting(false);
     }
-    const url = canvasRef.current.toDataURL("image/png");
-    const link = document.createElement("a");
-    link.download = filename;
-    link.href = url;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
   };
 
   const handleDrop = (e) => {
@@ -725,20 +810,6 @@ export default function App() {
     letterSpacing: "0.01em",
   });
 
-  const headerBtn = {
-    padding: "7px 14px",
-    fontSize: 11,
-    fontWeight: 500,
-    fontFamily: "inherit",
-    background: "#1e1e1e",
-    color: "#aaa",
-    border: "1px solid #333",
-    borderRadius: 5,
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-    letterSpacing: "0.01em",
-  };
-
   const recipeBtnStyle = (active) => ({
     width: "100%",
     padding: "8px 10px",
@@ -764,20 +835,23 @@ export default function App() {
       {/* ── Header ── */}
       <div ref={headerRef} className="app-header" style={{ borderBottom: "1px solid #1e1e1e", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, gap: 12 }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: 15, fontWeight: 600, letterSpacing: "-0.02em", color: "#eee" }}>Film Simulations</h1>
-          <p style={{ margin: "1px 0 0", fontSize: 10, color: "#555", letterSpacing: "0.08em", textTransform: "uppercase" }}>Fujifilm Colour Grading</p>
+          <h1 style={{ margin: 0, fontSize: 15, fontWeight: 600, letterSpacing: "-0.02em", color: "#eee" }}>Fujilab</h1>
+          <p style={{ margin: "1px 0 0", fontSize: 10, color: "#555", letterSpacing: "0.08em", textTransform: "uppercase" }}>Fujifilm Film Simulations</p>
         </div>
         <div className="header-actions" style={{ gap: 6, alignItems: "center" }}>
-          <button onClick={() => fileRef.current?.click()} style={headerBtn}>
+          <button onClick={() => fileRef.current?.click()} className="header-btn">
             {processing ? "Loading..." : "Load Image"}
           </button>
           <input ref={fileRef} type="file" accept="image/*,.raf" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && loadImageFile(e.target.files[0])} />
           {imageLoaded && (
             <>
-              <button onClick={() => setSplitView(!splitView)} style={{ ...headerBtn, ...(splitView ? { background: "#fff", color: "#111", borderColor: "#fff" } : {}) }}>
-                Before / After
+              <button onClick={() => setSplitView(!splitView)} className={`header-btn${splitView ? " active" : ""}`}>
+                Before/After
               </button>
-              <button onClick={handleExport} style={{ ...headerBtn, background: "#fff", color: "#111", borderColor: "#fff", fontWeight: 600 }}>
+              <button onClick={shareRecipeLink} className={`header-btn${shareCopied ? " success" : ""}`}>
+                {shareCopied ? "Copied" : "Share"}
+              </button>
+              <button onClick={() => setExportModalOpen(true)} className="header-btn primary">
                 Export
               </button>
             </>
@@ -795,15 +869,49 @@ export default function App() {
           style={{ display: "flex", justifyContent: "center", alignItems: "center", overflow: "hidden", position: "relative", background: "#0d0d0d", userSelect: "none" }}
         >
           {!imageLoaded ? (
-            <div
-              onClick={() => fileRef.current?.click()}
-              style={{ maxWidth: 480, width: "80%", border: "2px dashed #2a2a2a", borderRadius: 12, padding: "50px 36px", textAlign: "center", cursor: "pointer", transition: "border-color 0.2s" }}
-              onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#555")}
-              onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#2a2a2a")}
-            >
-              <div style={{ fontSize: 36, marginBottom: 14, opacity: 0.15 }}>&#9723;</div>
-              <p style={{ fontSize: 14, fontWeight: 500, margin: "0 0 6px", color: "#aaa" }}>Drop an image here</p>
-              <p style={{ fontSize: 12, color: "#555", margin: 0 }}>or click to browse &middot; supports JPG, PNG, WebP, RAF</p>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20, padding: "40px 24px", maxWidth: 480, width: "90%" }}>
+              {/* Sample image preview */}
+              <div style={{ position: "relative", width: "100%", borderRadius: 10, overflow: "hidden", cursor: "pointer" }} onClick={loadSampleImage}>
+                <img
+                  src="/boat.jpeg"
+                  alt="Sample photo"
+                  style={{ width: "100%", display: "block", borderRadius: 10, opacity: 0.75, transition: "opacity 0.2s" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
+                  onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.75")}
+                  onError={(e) => (e.currentTarget.parentElement.style.display = "none")}
+                />
+                <div style={{
+                  position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center", gap: 6,
+                  background: "rgba(0,0,0,0.35)", borderRadius: 10,
+                  pointerEvents: "none",
+                }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#fff", letterSpacing: "0.02em" }}>Try sample photo</span>
+                  <span style={{ fontSize: 11, color: "rgba(255,255,255,0.6)" }}>Click to load</span>
+                </div>
+              </div>
+
+              {/* Divider */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
+                <div style={{ flex: 1, height: 1, background: "#1e1e1e" }} />
+                <span style={{ fontSize: 11, color: "#333", flexShrink: 0 }}>or</span>
+                <div style={{ flex: 1, height: 1, background: "#1e1e1e" }} />
+              </div>
+
+              {/* Upload button */}
+              <div
+                onClick={() => fileRef.current?.click()}
+                style={{
+                  width: "100%", border: "1px dashed #2a2a2a", borderRadius: 8,
+                  padding: "18px 24px", textAlign: "center", cursor: "pointer",
+                  transition: "border-color 0.2s, background 0.2s",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#444"; e.currentTarget.style.background = "#111"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a2a"; e.currentTarget.style.background = "transparent"; }}
+              >
+                <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 4px", color: "#888" }}>Upload your photo</p>
+                <p style={{ fontSize: 11, color: "#333", margin: 0 }}>JPG, PNG, WebP, or Fuji RAF</p>
+              </div>
             </div>
           ) : (
             <div
@@ -822,12 +930,14 @@ export default function App() {
               {decodingRaw && (
                 <div style={{
                   position: "absolute", top: 12, right: 12, padding: "6px 12px",
-                  background: "rgba(0,0,0,0.7)", borderRadius: 6,
-                  fontSize: 11, color: "#aaa", letterSpacing: "0.03em",
+                  background: "rgba(0,0,0,0.7)", borderRadius: 6, maxWidth: 360,
+                  fontSize: 11, color: decodingRaw?.error ? "#c88" : "#aaa", letterSpacing: "0.03em",
                   display: "flex", alignItems: "center", gap: 8,
                 }}>
-                  <span style={{ display: "inline-block", width: 10, height: 10, border: "2px solid #555", borderTopColor: "#aaa", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-                  Decoding RAW...
+                  {decodingRaw === "decoding" && (
+                    <span style={{ display: "inline-block", width: 10, height: 10, border: "2px solid #555", borderTopColor: "#aaa", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+                  )}
+                  {decodingRaw === "decoding" ? "Decoding RAW..." : `RAW decode failed: ${decodingRaw?.error} — using camera JPEG`}
                 </div>
               )}
               {splitView && (
@@ -862,30 +972,34 @@ export default function App() {
 
           <div style={{ flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
           {/* Recipes */}
-          <Panel title="Recipes" defaultOpen={false}>
-            {RECIPE_CATEGORIES.map((cat) => {
+          <Panel title="Recipes" defaultOpen={true}>
+            <button
+              onClick={() => { setPasteModalOpen(true); setPasteWarnings([]); }}
+              className="paste-recipe-btn"
+            >
+              Paste a Recipe
+            </button>
+            {RECIPE_CATEGORIES.map((cat, catIdx) => {
               const catRecipes = RECIPES.filter((r) => r.category === cat);
               if (catRecipes.length === 0) return null;
+              const hasActive = catRecipes.some((r) => r.name === activeRecipe);
               return (
-                <div key={cat} style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 9, fontWeight: 600, color: "#555", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{cat}</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    {catRecipes.map((recipe) => (
-                      <div
-                        key={recipe.name}
-                        onClick={() => applyRecipe(recipe)}
-                        style={recipeBtnStyle(activeRecipe === recipe.name)}
-                      >
-                        <div style={{ fontSize: 11, fontWeight: activeRecipe === recipe.name ? 600 : 400, color: activeRecipe === recipe.name ? "#eee" : "#bbb" }}>
-                          {recipe.name}
-                        </div>
-                        <div style={{ fontSize: 9, color: "#555", marginTop: 1 }}>
-                          {recipe.description} &middot; {recipe.filmSim}
-                        </div>
+                <RecipeCategory key={cat} label={`${cat} (${catRecipes.length})`} defaultOpen={catIdx === 0 || hasActive}>
+                  {catRecipes.map((recipe) => (
+                    <div
+                      key={recipe.name}
+                      onClick={() => applyRecipe(recipe)}
+                      style={recipeBtnStyle(activeRecipe === recipe.name)}
+                    >
+                      <div style={{ fontSize: 11, fontWeight: activeRecipe === recipe.name ? 600 : 400, color: activeRecipe === recipe.name ? "#eee" : "#bbb" }}>
+                        {recipe.name}
                       </div>
-                    ))}
-                  </div>
-                </div>
+                      <div style={{ fontSize: 9, color: "#555", marginTop: 1 }}>
+                        {recipe.description}
+                      </div>
+                    </div>
+                  ))}
+                </RecipeCategory>
               );
             })}
           </Panel>
@@ -951,14 +1065,14 @@ export default function App() {
           <div style={{ padding: "12px 16px", display: "flex", gap: 6 }}>
             <button
               onClick={() => { setAdj(DEFAULT_ADJ); setCurves(DEFAULT_CURVES); setActivePreset("original"); setActiveRecipe(null); }}
-              style={{ flex: 1, padding: "7px 0", fontSize: 10, fontFamily: "inherit", background: "#1a1a1a", color: "#777", border: "1px solid #2a2a2a", borderRadius: 4, cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.05em" }}
+              className="action-btn"
             >
               Reset All
             </button>
             {imageLoaded && (
               <button
                 onClick={() => { setImageLoaded(false); originalDataRef.current = null; setAdj(DEFAULT_ADJ); setCurves(DEFAULT_CURVES); setActivePreset("original"); setActiveRecipe(null); }}
-                style={{ flex: 1, padding: "7px 0", fontSize: 10, fontFamily: "inherit", background: "#1a1a1a", color: "#777", border: "1px solid #2a2a2a", borderRadius: 4, cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.05em" }}
+                className="action-btn"
               >
                 New Image
               </button>
@@ -967,6 +1081,130 @@ export default function App() {
           </div>{/* end scrollable content */}
         </div>
       </div>
+
+      {/* ── Paste Recipe modal ── */}
+      {pasteModalOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setPasteModalOpen(false)}
+          onKeyDown={(e) => { if (e.key === "Escape") setPasteModalOpen(false); }}
+        >
+          <div
+            className="modal-panel"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: "min(440px, 90vw)", maxHeight: "80vh", display: "flex", flexDirection: "column", gap: 12 }}
+          >
+            <div>
+              <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: "#eee" }}>Paste Recipe</h2>
+              <p style={{ margin: "4px 0 0", fontSize: 11, color: "#555" }}>
+                From Fuji X Weekly or any standard format
+              </p>
+            </div>
+            <textarea
+              value={pasteText}
+              onChange={(e) => setPasteText(e.target.value)}
+              placeholder={"Film Simulation: Classic Chrome\nGrain Effect: Weak, Small\nColor Chrome Effect: Strong\nHighlight: -2\nShadow: 0\nWhite Balance: Auto, +4 Red & -2 Blue"}
+              autoFocus
+              style={{
+                width: "100%", minHeight: 160, padding: 10,
+                fontSize: 12, fontFamily: "'SF Mono', 'Menlo', monospace", lineHeight: 1.5,
+                background: "#111", color: "#ccc", border: "1px solid #2a2a2a",
+                borderRadius: 6, resize: "vertical",
+                boxSizing: "border-box",
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handlePasteRecipe();
+                if (e.key === "Escape") setPasteModalOpen(false);
+              }}
+            />
+            {pasteWarnings.length > 0 && (
+              <div style={{ padding: "8px 10px", background: "#1c1a10", border: "1px solid #3a3520", borderRadius: 6 }}>
+                {pasteWarnings.map((w, i) => (
+                  <div key={i} style={{ fontSize: 11, color: "#c8a84e", lineHeight: 1.5 }}>{w}</div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setPasteModalOpen(false)} className="modal-cancel">Cancel</button>
+              <button onClick={handlePasteRecipe} disabled={!pasteText.trim()} className="modal-confirm">
+                Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Export modal ── */}
+      {exportModalOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setExportModalOpen(false)}
+          onKeyDown={(e) => { if (e.key === "Escape") setExportModalOpen(false); }}
+        >
+          <div
+            className="modal-panel"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: "min(380px, 90vw)", display: "flex", flexDirection: "column", gap: 16 }}
+          >
+            <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: "#eee" }}>Export</h2>
+
+            {/* Format */}
+            <div>
+              <div style={{ fontSize: 11, color: "#777", marginBottom: 6 }}>Format</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                {["jpeg", "png"].map((fmt) => (
+                  <button
+                    key={fmt}
+                    onClick={() => setExportFormat(fmt)}
+                    className={`header-btn${exportFormat === fmt ? " active" : ""}`}
+                    style={{ flex: 1, textAlign: "center", textTransform: "uppercase" }}
+                  >
+                    {fmt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Quality (JPEG only) */}
+            {exportFormat === "jpeg" && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                  <span style={{ fontSize: 11, color: "#777" }}>Quality</span>
+                  <span style={{ fontSize: 11, color: "#555", fontVariantNumeric: "tabular-nums" }}>{exportQuality}%</span>
+                </div>
+                <input
+                  type="range" min={50} max={100} value={exportQuality}
+                  onChange={(e) => setExportQuality(Number(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            )}
+
+            {/* Full resolution toggle */}
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox" checked={exportFullRes}
+                onChange={(e) => setExportFullRes(e.target.checked)}
+                style={{ accentColor: "#888" }}
+              />
+              <div>
+                <div style={{ fontSize: 11, color: "#ccc" }}>Full resolution</div>
+                <div style={{ fontSize: 10, color: "#555" }}>
+                  {exportFullRes ? "Native size — may take a moment" : `${dimsRef.current.w} x ${dimsRef.current.h} px`}
+                </div>
+              </div>
+            </label>
+
+            {/* Actions */}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setExportModalOpen(false)} className="modal-cancel">Cancel</button>
+              <button onClick={doExport} disabled={exporting} className="modal-confirm">
+                {exporting ? "Exporting..." : "Download"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Lightbox overlay ── */}
       {lightboxUrl && (

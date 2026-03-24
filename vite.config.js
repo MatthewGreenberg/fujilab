@@ -11,6 +11,6 @@ export default defineConfig({
     wasm(),
   ],
   optimizeDeps: {
-    exclude: ['libraw-wasm'],
+    exclude: ['libraw-mini'],
   },
 })

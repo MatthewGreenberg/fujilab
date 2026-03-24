@@ -1,18 +1,34 @@
-# React + Vite
+# Fujilab
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A browser-based photo editor that applies Fujifilm film simulations to your images using WebGL.
 
-Currently, two official plugins are available:
+[**Try it live →**](https://fujilab.vercel.app)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Features
 
-## React Compiler
+- **Film simulations** — 12 authentic Fujifilm looks (Provia, Velvia, Classic Chrome, Acros, and more) applied via 3D LUTs
+- **Fuji-specific controls** — Highlight Rolloff, Color Chrome, Color Chrome FX Blue, Fade
+- **Full adjustment panel** — Exposure, contrast, highlights/shadows, whites/blacks, tone curves, color, grain, vignette
+- **RAW support** — Drag in a Fujifilm `.RAF` file; embedded JPEG preview appears instantly while the full RAW decodes via WebAssembly (libraw-mini)
+- **Recipes** — Built-in community recipes, or paste any recipe from Fuji X Weekly
+- **Shareable links** — Copy a URL that encodes your current settings
+- **Before/After split view** — Drag a divider to compare original and edited
+- **Export** — Download as JPEG or PNG, optionally at full native resolution
+- **Mobile-friendly** — Drag-up bottom sheet on small screens
 
-The React Compiler is enabled on this template. See [this documentation](https://react.dev/learn/react-compiler) for more information.
+## Stack
 
-Note: This will impact Vite dev & build performances.
+- React 19 + Vite
+- WebGL 2 (custom GLSL renderer)
+- [libraw-mini](https://github.com/nicktindall/libraw-mini) — LibRaw compiled to WASM for RAW decoding
 
-## Expanding the ESLint configuration
+## Getting started
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```bash
+npm install
+npm run dev
+```
+
+## LUTs
+
+The bundled `.3dl` LUT files in `public/luts/` are derived from the open-source [Fuji XTrans III LUT pack](https://blog.sowerby.me/fuji-film-simulation-profiles/). You can also drag your own `.3dl` or `.cube` LUT files onto the app to load them.

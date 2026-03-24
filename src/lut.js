@@ -67,39 +67,3 @@ export function parseCube(text) {
   return { size, data };
 }
 
-/*
-  Trilinear interpolation on a 3D LUT
-*/
-export function applyLUT(lut, r, g, b) {
-  const { size, data } = lut;
-  const maxIdx = size - 1;
-
-  const rf = (r / 255) * maxIdx;
-  const gf = (g / 255) * maxIdx;
-  const bf = (b / 255) * maxIdx;
-
-  const r0 = Math.min(Math.floor(rf), maxIdx - 1);
-  const g0 = Math.min(Math.floor(gf), maxIdx - 1);
-  const b0 = Math.min(Math.floor(bf), maxIdx - 1);
-  const r1 = r0 + 1, g1 = g0 + 1, b1 = b0 + 1;
-  const rd = rf - r0, gd = gf - g0, bd = bf - b0;
-
-  const idx = (ri, gi, bi) => (ri * size * size + gi * size + bi) * 3;
-  const i000 = idx(r0, g0, b0), i100 = idx(r1, g0, b0);
-  const i010 = idx(r0, g1, b0), i110 = idx(r1, g1, b0);
-  const i001 = idx(r0, g0, b1), i101 = idx(r1, g0, b1);
-  const i011 = idx(r0, g1, b1), i111 = idx(r1, g1, b1);
-
-  const lerp = (a, b, t) => a + (b - a) * t;
-  const out = [0, 0, 0];
-  for (let c = 0; c < 3; c++) {
-    const c00 = lerp(data[i000 + c], data[i100 + c], rd);
-    const c10 = lerp(data[i010 + c], data[i110 + c], rd);
-    const c01 = lerp(data[i001 + c], data[i101 + c], rd);
-    const c11 = lerp(data[i011 + c], data[i111 + c], rd);
-    const c0 = lerp(c00, c10, gd);
-    const c1 = lerp(c01, c11, gd);
-    out[c] = lerp(c0, c1, bd) * 255;
-  }
-  return out;
-}

@@ -8,6 +8,16 @@
   to { transform: rotate(360deg); }
 }
 
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
 body {
   margin: 0;
   background: #111;
@@ -21,7 +31,13 @@ body {
   height: 100dvh !important;
 }
 
-/* Dark scrollbar for sidebar */
+/* ── Focus ── */
+:focus-visible {
+  outline: 1px solid #666;
+  outline-offset: 2px;
+}
+
+/* ── Dark scrollbar for sidebar ── */
 ::-webkit-scrollbar {
   width: 5px;
 }
@@ -36,7 +52,96 @@ body {
   background: #444;
 }
 
-/* Slim range inputs */
+/* ── Buttons ── */
+button {
+  transition: background 0.15s, color 0.15s, border-color 0.15s, opacity 0.15s;
+}
+button:active:not(:disabled) {
+  opacity: 0.8;
+}
+
+/* Header action buttons */
+.header-btn {
+  padding: 7px 14px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: inherit;
+  background: #1e1e1e;
+  color: #aaa;
+  border: 1px solid #333;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+}
+.header-btn:hover {
+  background: #252525;
+  border-color: #444;
+  color: #ccc;
+}
+.header-btn.active {
+  background: #fff;
+  color: #111;
+  border-color: #fff;
+}
+.header-btn.primary {
+  background: #fff;
+  color: #111;
+  border-color: #fff;
+  font-weight: 600;
+}
+.header-btn.primary:hover {
+  background: #e8e8e8;
+  border-color: #e8e8e8;
+}
+.header-btn.success {
+  background: #1a3a1a;
+  color: #6c6;
+  border-color: #2a4a2a;
+}
+
+/* Paste recipe button */
+.paste-recipe-btn {
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: inherit;
+  background: #1e1e1e;
+  color: #aaa;
+  border: 1px dashed #3a3a3a;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: center;
+}
+.paste-recipe-btn:hover {
+  border-color: #666;
+  color: #ddd;
+  background: #222;
+}
+
+/* Bottom bar action buttons */
+.action-btn {
+  flex: 1;
+  padding: 7px 0;
+  font-size: 10px;
+  font-family: inherit;
+  background: #1a1a1a;
+  color: #777;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.action-btn:hover {
+  background: #222;
+  border-color: #3a3a3a;
+  color: #999;
+}
+
+/* ── Slim range inputs ── */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
@@ -54,10 +159,11 @@ input[type="range"]::-webkit-slider-thumb {
   background: #888;
   cursor: pointer;
   border: none;
-  transition: background 0.1s;
+  transition: background 0.15s, transform 0.15s;
 }
 input[type="range"]::-webkit-slider-thumb:hover {
   background: #aaa;
+  transform: scale(1.15);
 }
 input[type="range"]::-moz-range-thumb {
   width: 12px;
@@ -71,6 +177,61 @@ input[type="range"]::-moz-range-track {
   height: 3px;
   background: #2a2a2a;
   border-radius: 2px;
+}
+
+/* ── Modals ── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.15s ease-out;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+.modal-panel {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 24px;
+  animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.modal-cancel {
+  padding: 7px 16px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: inherit;
+  background: transparent;
+  color: #888;
+  border: 1px solid #333;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.modal-cancel:hover {
+  background: #222;
+  color: #aaa;
+}
+.modal-confirm {
+  padding: 7px 20px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  background: #fff;
+  color: #111;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.modal-confirm:hover {
+  background: #e8e8e8;
+}
+.modal-confirm:disabled {
+  background: #333;
+  color: #666;
+  cursor: default;
 }
 
 /* ── Responsive layout ── */
@@ -157,5 +318,13 @@ input[type="range"]::-moz-range-track {
   input[type="range"]::-moz-range-thumb {
     width: 20px;
     height: 20px;
+  }
+}
+
+/* ── Reduced motion ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }
