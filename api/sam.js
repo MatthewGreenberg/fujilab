@@ -27,9 +27,9 @@ export default async function handler(req, res) {
           version: SAM2_VERSION,
           input: {
             image,
-            points_per_side: 16,
-            pred_iou_thresh: 0.86,
-            stability_score_thresh: 0.92,
+            points_per_side: 8,
+            pred_iou_thresh: 0.8,
+            stability_score_thresh: 0.88,
             use_m2m: true,
           },
         }),

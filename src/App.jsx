@@ -617,14 +617,17 @@ export default function App() {
       for (const m of masks) m._size = m.data.reduce((s, v) => s + v, 0);
     }
 
-    // Find the smallest mask that contains the clicked point
+    // Find the largest mask that contains the clicked point (whole subject, not parts)
+    const totalPixels = dimsRef.current.w * dimsRef.current.h;
     let best = null;
-    let bestSize = Infinity;
+    let bestSize = 0;
     for (const m of masks) {
       const mx = Math.min(m.width - 1, Math.max(0, Math.round(clickX / dimsRef.current.w * m.width)));
       const my = Math.min(m.height - 1, Math.max(0, Math.round(clickY / dimsRef.current.h * m.height)));
       const idx = my * m.width + mx;
-      if (m.data[idx] && m._size < bestSize) {
+      // Prefer the largest mask that isn't the whole image (< 55% coverage)
+      const coverageRatio = m._size / (m.width * m.height);
+      if (m.data[idx] && m._size > bestSize && coverageRatio < 0.55) {
         best = m;
         bestSize = m._size;
       }
@@ -636,11 +639,12 @@ export default function App() {
       for (const m of masks) {
         const sx = clickX / dimsRef.current.w * m.width;
         const sy = clickY / dimsRef.current.h * m.height;
+        const coverageRatio = m._size / (m.width * m.height);
         for (let dy = -searchRadius; dy <= searchRadius && !best; dy += 4) {
           for (let dx = -searchRadius; dx <= searchRadius && !best; dx += 4) {
             const px = Math.min(m.width - 1, Math.max(0, Math.round(sx + dx)));
             const py = Math.min(m.height - 1, Math.max(0, Math.round(sy + dy)));
-            if (m.data[py * m.width + px] && m._size < bestSize) {
+            if (m.data[py * m.width + px] && m._size > bestSize && coverageRatio < 0.55) {
               best = m;
               bestSize = m._size;
             }
