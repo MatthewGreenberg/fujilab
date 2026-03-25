@@ -130,6 +130,8 @@ function Dial({ label, value, min, max, step = 0.05, defaultValue = 0, onChange,
   const display = format ? format(value) : value;
   const dialRef = useRef(null);
   const dragRef = useRef(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
 
   const SIZE = 80;
   const ARC_START = 225; // degrees (bottom-left)
@@ -142,7 +144,7 @@ function Dial({ label, value, min, max, step = 0.05, defaultValue = 0, onChange,
   const onStart = (e) => {
     e.preventDefault();
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    dragRef.current = { startY: clientY, startValue: value };
+    dragRef.current = { startY: clientY, startValue: valueRef.current };
 
     const onMove = (me) => {
       me.preventDefault();
