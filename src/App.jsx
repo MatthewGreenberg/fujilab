@@ -125,6 +125,126 @@ function Slider({ label, value, min, max, step = 1, defaultValue = 0, onChange, 
   );
 }
 
+/* ── Rotary dial control (Fuji X100VI style) ── */
+function Dial({ label, value, min, max, step = 0.05, defaultValue = 0, onChange, format }) {
+  const display = format ? format(value) : value;
+  const dialRef = useRef(null);
+  const dragRef = useRef(null);
+
+  const SIZE = 80;
+  const ARC_START = 225; // degrees (bottom-left)
+  const ARC_RANGE = 270; // total arc degrees
+
+  const valueToAngle = (v) => ARC_START - ((v - min) / (max - min)) * ARC_RANGE;
+  const angleToValue = (deg) => {
+    let a = ARC_START - deg;
+    if (a < 0) a += 360;
+    if (a > ARC_RANGE) a = a > ARC_RANGE + 45 ? 0 : ARC_RANGE;
+    const raw = min + (a / ARC_RANGE) * (max - min);
+    return Math.round(raw / step) * step;
+  };
+
+  const getAngleFromEvent = (e, rect) => {
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    let deg = Math.atan2(cy - clientY, clientX - cx) * (180 / Math.PI);
+    if (deg < 0) deg += 360;
+    return deg;
+  };
+
+  const onStart = (e) => {
+    e.preventDefault();
+    const rect = dialRef.current.getBoundingClientRect();
+    dragRef.current = { rect };
+    const angle = getAngleFromEvent(e, rect);
+    onChange(angleToValue(angle));
+
+    const onMove = (me) => {
+      me.preventDefault();
+      const a = getAngleFromEvent(me, dragRef.current.rect);
+      onChange(angleToValue(a));
+    };
+    const onEnd = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onEnd);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onEnd);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onEnd);
+    window.addEventListener("touchmove", onMove, { passive: false });
+    window.addEventListener("touchend", onEnd);
+  };
+
+  // Generate tick marks
+  const ticks = [];
+  const tickCount = Math.round((max - min) / step);
+  const majorEvery = tickCount > 20 ? 5 : tickCount > 10 ? 2 : 1;
+  for (let i = 0; i <= tickCount; i++) {
+    if (tickCount > 40 && i % 5 !== 0) continue; // skip ticks if too dense
+    const v = min + (i / tickCount) * (max - min);
+    const ang = valueToAngle(v) * (Math.PI / 180);
+    const isMajor = i % majorEvery === 0;
+    const r1 = SIZE / 2 - (isMajor ? 10 : 7);
+    const r2 = SIZE / 2 - 3;
+    ticks.push({
+      x1: SIZE / 2 + Math.cos(ang) * r1,
+      y1: SIZE / 2 - Math.sin(ang) * r1,
+      x2: SIZE / 2 + Math.cos(ang) * r2,
+      y2: SIZE / 2 - Math.sin(ang) * r2,
+      major: isMajor,
+    });
+  }
+
+  // Current value indicator
+  const valAngle = valueToAngle(value) * (Math.PI / 180);
+  const dotR = SIZE / 2 - 6;
+  const dotX = SIZE / 2 + Math.cos(valAngle) * dotR;
+  const dotY = SIZE / 2 - Math.sin(valAngle) * dotR;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+      <svg
+        ref={dialRef}
+        width={SIZE}
+        height={SIZE}
+        viewBox={`0 0 ${SIZE} ${SIZE}`}
+        onMouseDown={onStart}
+        onTouchStart={onStart}
+        onDoubleClick={() => onChange(defaultValue)}
+        style={{ cursor: "grab", userSelect: "none", touchAction: "none" }}
+      >
+        {/* Background */}
+        <defs>
+          <radialGradient id="dialGrad">
+            <stop offset="0%" stopColor="#1e1e1e" />
+            <stop offset="100%" stopColor="#111" />
+          </radialGradient>
+        </defs>
+        <circle cx={SIZE / 2} cy={SIZE / 2} r={SIZE / 2 - 1} fill="url(#dialGrad)" stroke="#333" strokeWidth="1" />
+
+        {/* Tick marks */}
+        {ticks.map((t, i) => (
+          <line key={i} x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2}
+            stroke={t.major ? "#555" : "#333"} strokeWidth={t.major ? 1.5 : 0.75} strokeLinecap="round" />
+        ))}
+
+        {/* Value indicator dot */}
+        <circle cx={dotX} cy={dotY} r={3.5} fill="#ccc" />
+
+        {/* Center value text */}
+        <text x={SIZE / 2} y={SIZE / 2 - 2} textAnchor="middle" dominantBaseline="central"
+          fill="#aaa" fontSize="13" fontFamily="'SF Mono', 'Menlo', monospace" fontWeight="500">
+          {display}
+        </text>
+      </svg>
+      <span style={{ fontSize: 9, color: "#666", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600 }}>{label}</span>
+    </div>
+  );
+}
+
 /* ── Collapsible recipe category ── */
 function RecipeCategory({ label, children, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -1776,7 +1896,10 @@ export default function App() {
 
           {/* Basic */}
           <Panel title="Basic" defaultOpen={false}>
-            <Slider label="Exposure" value={adj.exposure} min={-5} max={5} step={0.05} onChange={(v) => setField("exposure", v)} format={(v) => (v > 0 ? "+" : "") + v.toFixed(2)} />
+            <div style={{ display: "flex", justifyContent: "center", gap: 20, marginBottom: 14 }}>
+              <Dial label="Exposure" value={adj.exposure} min={-5} max={5} step={0.05} defaultValue={0} onChange={(v) => setField("exposure", v)} format={(v) => (v > 0 ? "+" : "") + v.toFixed(1)} />
+              <Dial label="Temperature" value={adj.temperature} min={-100} max={100} step={1} defaultValue={0} onChange={(v) => setField("temperature", v)} format={signFmt} />
+            </div>
             <Slider label="Contrast" value={adj.contrast} min={-100} max={100} onChange={(v) => setField("contrast", v)} format={signFmt} />
             <Slider label="Highlights" value={adj.highlights} min={-100} max={100} onChange={(v) => setField("highlights", v)} format={signFmt} />
             <Slider label="Shadows" value={adj.shadows} min={-100} max={100} onChange={(v) => setField("shadows", v)} format={signFmt} />
@@ -1791,7 +1914,6 @@ export default function App() {
 
           {/* Color */}
           <Panel title="Color" defaultOpen={false}>
-            <Slider label="Temperature" value={adj.temperature} min={-100} max={100} onChange={(v) => setField("temperature", v)} format={signFmt} />
             <Slider label="Tint" value={adj.tint} min={-100} max={100} onChange={(v) => setField("tint", v)} format={signFmt} />
             <Slider label="Vibrance" value={adj.vibrance} min={-100} max={100} onChange={(v) => setField("vibrance", v)} format={signFmt} />
             <Slider label="Saturation" value={adj.saturation} min={-100} max={100} onChange={(v) => setField("saturation", v)} format={signFmt} />
