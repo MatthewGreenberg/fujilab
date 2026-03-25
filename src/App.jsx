@@ -154,17 +154,26 @@ function Dial({ label, value, min, max, step = 0.05, defaultValue = 0, onChange,
     return deg;
   };
 
+  const DAMPEN = 0.15; // how much drag is needed — lower = stiffer
+
   const onStart = (e) => {
     e.preventDefault();
     const rect = dialRef.current.getBoundingClientRect();
-    dragRef.current = { rect };
-    const angle = getAngleFromEvent(e, rect);
-    onChange(angleToValue(angle));
+    const startAngle = getAngleFromEvent(e, rect);
+    const startValue = value;
+    dragRef.current = { rect, startAngle, startValue };
 
     const onMove = (me) => {
       me.preventDefault();
-      const a = getAngleFromEvent(me, dragRef.current.rect);
-      onChange(angleToValue(a));
+      const curAngle = getAngleFromEvent(me, dragRef.current.rect);
+      let delta = curAngle - dragRef.current.startAngle;
+      // Handle wrapping around 0/360
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      const valueDelta = (delta / ARC_RANGE) * (max - min) * DAMPEN;
+      const raw = dragRef.current.startValue - valueDelta;
+      const clamped = Math.max(min, Math.min(max, raw));
+      onChange(Math.round(clamped / step) * step);
     };
     const onEnd = () => {
       window.removeEventListener("mousemove", onMove);
