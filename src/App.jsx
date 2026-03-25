@@ -136,42 +136,20 @@ function Dial({ label, value, min, max, step = 0.05, defaultValue = 0, onChange,
   const ARC_RANGE = 270; // total arc degrees
 
   const valueToAngle = (v) => ARC_START - ((v - min) / (max - min)) * ARC_RANGE;
-  const angleToValue = (deg) => {
-    let a = ARC_START - deg;
-    if (a < 0) a += 360;
-    if (a > ARC_RANGE) a = a > ARC_RANGE + 45 ? 0 : ARC_RANGE;
-    const raw = min + (a / ARC_RANGE) * (max - min);
-    return Math.round(raw / step) * step;
-  };
 
-  const getAngleFromEvent = (e, rect) => {
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    let deg = Math.atan2(cy - clientY, clientX - cx) * (180 / Math.PI);
-    if (deg < 0) deg += 360;
-    return deg;
-  };
-
-  const DAMPEN = 0.15; // how much drag is needed — lower = stiffer
+  const SENSITIVITY = 0.004; // value change per pixel of vertical drag
 
   const onStart = (e) => {
     e.preventDefault();
-    const rect = dialRef.current.getBoundingClientRect();
-    const startAngle = getAngleFromEvent(e, rect);
-    const startValue = value;
-    dragRef.current = { rect, startAngle, startValue };
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    dragRef.current = { startY: clientY, startValue: value };
 
     const onMove = (me) => {
       me.preventDefault();
-      const curAngle = getAngleFromEvent(me, dragRef.current.rect);
-      let delta = curAngle - dragRef.current.startAngle;
-      // Handle wrapping around 0/360
-      if (delta > 180) delta -= 360;
-      if (delta < -180) delta += 360;
-      const valueDelta = (delta / ARC_RANGE) * (max - min) * DAMPEN;
-      const raw = dragRef.current.startValue - valueDelta;
+      const curY = me.touches ? me.touches[0].clientY : me.clientY;
+      const dy = dragRef.current.startY - curY; // up = positive
+      const valueDelta = dy * SENSITIVITY * (max - min);
+      const raw = dragRef.current.startValue + valueDelta;
       const clamped = Math.max(min, Math.min(max, raw));
       onChange(Math.round(clamped / step) * step);
     };
